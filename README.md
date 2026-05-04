@@ -155,3 +155,7 @@ SIMD-group matrix variant is fastest but requires shapes divisible by 8.
 
 The library has no external runtime dependencies aside from Metal itself
 and a C++20 compiler.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

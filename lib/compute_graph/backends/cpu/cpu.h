@@ -22,6 +22,10 @@ public:
     // Retrieve the output tensor computed for a node
     const cg::Tensor& result(cg::Node* node) const;
     void              clear() { results_.clear(); }
+    // For API parity with metal::Executor — CPU has no host cache to invalidate
+    // (each visit overwrites its results_ entry, so a fresh accept() produces
+    // fresh values).
+    void              reset() {}
 
 private:
     std::unordered_map<cg::Node*, cg::Tensor> results_;

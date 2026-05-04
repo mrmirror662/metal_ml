@@ -235,7 +235,8 @@ public:
     }
 
     bool is_dag() const;
-    void accept(Visitor& v);
+    void accept(Visitor& v);              // visits every node
+    void accept(Visitor& v, Node* root);  // only nodes that `root` depends on
 
 private:
     std::vector<std::unique_ptr<Node>> nodes_;

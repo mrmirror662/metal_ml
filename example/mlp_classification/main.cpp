@@ -1,5 +1,11 @@
-// MNIST MLP. Forward + backward + SGD update — all in one cg::ComputeGraph.
-// Layers (nn::Dense) own their parameters; no manual W/b declarations.
+// MNIST MLP. ONE compute graph holds forward + backward + SGD update.
+// - Training step: full accept (runs every node)
+// - Eval step:     subgraph accept stopping at the softmax output, so the
+//                  backward and SGD nodes are skipped — parameters aren't
+//                  modified during evaluation.
+//
+// Graph structure is built once. Per-batch we mutate InputNode tensors in
+// place; the executor detects existing buffers and just memcpy's new data.
 
 #include "cg.h"
 #include "nn.h"
@@ -24,11 +30,8 @@ struct MLP {
     nn::Dense fc1, fc2;
     MLP(std::mt19937& rng) : fc1(784, 128, rng), fc2(128, 10, rng) {}
 
-    // Returns logits (pre-softmax)
     Node* forward(ComputeGraph& g, Node* x, int batch) {
-        auto* z1 = fc1(g, x, batch);
-        auto* a1 = nn::relu(g, z1);
-        return     fc2(g, a1, batch);
+        return fc2(g, nn::relu(g, fc1(g, x, batch)), batch);
     }
 
     std::vector<Node*> params() const {
@@ -47,116 +50,123 @@ struct MLP {
     void refresh(Exec& exec) { fc1.refresh(exec); fc2.refresh(exec); }
 };
 
-// ---- Train one batch ----------------------------------------------------
-template <typename Executor>
-static std::pair<float, int>
-train_step(MLP& mlp, const Tensor& X, const std::vector<int>& Y, float lr,
-           Executor& exec, bool print_graph)
-{
-    int batch = X.shape[0];
-    int n_cls = 10;
+// ---- Trainer: ONE graph for everything ----------------------------------
+struct Trainer {
+    static constexpr int batch = 64;
+    static constexpr int n_cls = 10;
 
+    MLP          mlp;
     ComputeGraph g;
-    auto* x  = g.emplace<InputNode>("X",  X);
-    auto* oh = g.emplace<InputNode>("OH", mnist::one_hot(Y, n_cls));
+    InputNode   *X_in  = nullptr;
+    InputNode   *OH_in = nullptr;
+    Node        *y     = nullptr;     // softmax output — used by both train & eval
 
-    auto* logits = mlp.forward(g, x, batch);
-    auto* y      = nn::softmax(g, logits);
+    Trainer(std::mt19937& rng, float lr) : mlp(rng) {
+        X_in  = g.emplace<InputNode>("X",  Tensor({batch, 784}));
+        OH_in = g.emplace<InputNode>("OH", Tensor({batch, n_cls}));
 
-    auto* dz = nn::softmax_ce_backward(g, y, oh, batch);
-    autograd::BackwardBuilder bb(g);
-    bb.seed(logits, dz);
-    bb.build(mlp.params());
+        auto* logits = mlp.forward(g, X_in, batch);
+        y = nn::softmax(g, logits);
 
-    mlp.apply_sgd(g, bb, lr);
-
-    if (print_graph) {
-        std::cout << "--- TRAIN GRAPH ---\n";
-        PrintVisitor p; g.accept(p); std::cout << "\n";
+        auto* dz = nn::softmax_ce_backward(g, y, OH_in, batch);
+        autograd::BackwardBuilder bb(g);
+        bb.seed(logits, dz);
+        bb.build(mlp.params());
+        mlp.apply_sgd(g, bb, lr);
     }
+};
 
-    exec.clear();
-    g.accept(exec);
+// ---- Helpers -------------------------------------------------------------
+static void fill_train_batch(Trainer& t, const mnist::Dataset& tr,
+                             const std::vector<int>& idx, int b_off)
+{
+    std::fill(t.OH_in->tensor.data.begin(), t.OH_in->tensor.data.end(), 0.0f);
+    for (int i = 0; i < Trainer::batch; ++i) {
+        int s = idx[b_off + i];
+        std::memcpy(t.X_in->tensor.data.data() + i * 784,
+                    tr.images.data.data()      + s * 784,
+                    784 * sizeof(float));
+        t.OH_in->tensor.data[i * Trainer::n_cls + tr.labels[s]] = 1.0f;
+    }
+}
 
-    const Tensor& y_v = exec.result(y);
+static std::pair<float, int>
+loss_and_acc(const Tensor& y, const std::vector<int>& Y) {
     float loss = 0.0f; int correct = 0;
-    for (int i = 0; i < batch; ++i) {
-        const float* row = y_v.data.data() + i * n_cls;
+    for (int i = 0; i < Trainer::batch; ++i) {
+        const float* row = y.data.data() + i * Trainer::n_cls;
         loss -= std::log(std::max(row[Y[i]], 1e-9f));
         int pred = 0;
-        for (int j = 1; j < n_cls; ++j) if (row[j] > row[pred]) pred = j;
+        for (int j = 1; j < Trainer::n_cls; ++j) if (row[j] > row[pred]) pred = j;
         if (pred == Y[i]) ++correct;
     }
-    loss /= batch;
-
-    mlp.refresh(exec);
-    return {loss, correct};
+    return {loss / Trainer::batch, correct};
 }
 
+// ---- Eval: run forward subgraph (everything that y depends on) ----------
 template <typename Executor>
-static float evaluate(MLP& mlp, const Tensor& X, const std::vector<int>& Y, Executor& exec) {
-    int batch = X.shape[0];
-    int n_cls = 10;
-
-    ComputeGraph g;
-    auto* x      = g.emplace<InputNode>("X", X);
-    auto* logits = mlp.forward(g, x, batch);
-    auto* y      = nn::softmax(g, logits);
-
-    exec.clear(); g.accept(exec);
-    const Tensor& yv = exec.result(y);
-
-    int correct = 0;
-    for (int i = 0; i < batch; ++i) {
-        const float* row = yv.data.data() + i * n_cls;
-        int pred = 0;
-        for (int j = 1; j < n_cls; ++j) if (row[j] > row[pred]) pred = j;
-        if (pred == Y[i]) ++correct;
+static float evaluate(Trainer& t, const mnist::Dataset& te, Executor& exec) {
+    int n = (int)te.labels.size();
+    int correct = 0, total = 0;
+    for (int b = 0; b + Trainer::batch <= n; b += Trainer::batch) {
+        std::memcpy(t.X_in->tensor.data.data(),
+                    te.images.data.data() + b * 784,
+                    Trainer::batch * 784 * sizeof(float));
+        exec.reset();
+        t.g.accept(exec, t.y);              // <-- subgraph: forward only
+        const Tensor& yv = exec.result(t.y);
+        for (int i = 0; i < Trainer::batch; ++i) {
+            const float* row = yv.data.data() + i * Trainer::n_cls;
+            int pred = 0;
+            for (int j = 1; j < Trainer::n_cls; ++j) if (row[j] > row[pred]) pred = j;
+            if (pred == te.labels[b + i]) ++correct;
+        }
+        total += Trainer::batch;
     }
-    return (float)correct / batch;
+    return (float)correct / total;
 }
 
+// ---- Train loop ----------------------------------------------------------
 template <typename Executor>
 static void train(const char* label, const mnist::Dataset& tr, const mnist::Dataset& te,
                   Executor& exec)
 {
-    constexpr int   batch_size = 64, n_epochs = 5;
-    constexpr float lr         = 0.1f;
+    constexpr int   n_epochs = 5;
+    constexpr float lr       = 0.1f;
     std::cout << "\n===== Training on " << label << " =====\n";
 
     std::mt19937 rng(42);
-    MLP mlp(rng);
+    Trainer trainer(rng, lr);
 
     int n = (int)tr.labels.size();
     std::vector<int> idx(n);
     for (int i = 0; i < n; ++i) idx[i] = i;
-    bool printed = false;
 
     for (int epoch = 0; epoch < n_epochs; ++epoch) {
         std::shuffle(idx.begin(), idx.end(), rng);
         float loss = 0.0f; int correct = 0, batches = 0;
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        for (int b = 0; b + batch_size <= n; b += batch_size) {
-            Tensor X({batch_size, 784});
-            std::vector<int> Y(batch_size);
-            for (int i = 0; i < batch_size; ++i) {
-                int s = idx[b + i];
-                std::memcpy(X.data.data() + i * 784,
-                            tr.images.data.data() + s * 784, 784 * sizeof(float));
-                Y[i] = tr.labels[s];
-            }
-            auto [l, c] = train_step(mlp, X, Y, lr, exec, !printed);
-            printed = true;
+        for (int b = 0; b + Trainer::batch <= n; b += Trainer::batch) {
+            fill_train_batch(trainer, tr, idx, b);
+
+            exec.reset();
+            trainer.g.accept(exec);          // full graph: fwd + bwd + SGD
+
+            std::vector<int> Y(Trainer::batch);
+            for (int i = 0; i < Trainer::batch; ++i) Y[i] = tr.labels[idx[b + i]];
+            auto [l, c] = loss_and_acc(exec.result(trainer.y), Y);
             loss += l; correct += c; ++batches;
+
+            trainer.mlp.refresh(exec);
         }
         double secs = std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now() - t0).count();
-        float test_acc = evaluate(mlp, te.images, te.labels, exec);
+        float test_acc = evaluate(trainer, te, exec);
 
         std::cout << "[" << label << "] ep " << (epoch + 1) << "/" << n_epochs
                   << "  loss "      << (loss / batches)
-                  << "  train_acc " << (100.0f * correct / (batches * batch_size)) << "%"
+                  << "  train_acc " << (100.0f * correct / (batches * Trainer::batch)) << "%"
                   << "  test_acc "  << (100.0f * test_acc) << "%"
                   << "  ("          << secs << "s)\n";
     }

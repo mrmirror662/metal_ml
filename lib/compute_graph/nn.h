@@ -7,6 +7,8 @@
 
 #include <cmath>
 #include <random>
+#include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace cg::nn {
@@ -121,6 +123,10 @@ public:
         for (auto& v : W_.data) v = d(rng);
     }
 
+    // Bind to a graph and return its output. Each layer binds to ONE graph
+    // (the most recent operator() call wins). For evaluation, run a subgraph
+    // of that same training graph via `g.accept(visitor, output_node)` —
+    // don't call operator() with a second graph.
     Node* operator()(ComputeGraph& g, Node* x, int batch) {
         W_n_ = g.emplace<InputNode>("W", W_);
         b_n_ = g.emplace<InputNode>("b", b_);
@@ -131,20 +137,31 @@ public:
 
     template <typename BB>
     void apply_sgd(ComputeGraph& g, BB& bb, float lr) {
-        W_u_ = sgd_step(g, W_n_, bb.grad(W_n_), lr);
-        b_u_ = sgd_step(g, b_n_, bb.grad(b_n_), lr);
+        if (!W_n_ || !b_n_)
+            throw std::runtime_error("Dense::apply_sgd: layer not bound to a graph (call operator() first)");
+        Node* gW = bb.grad(W_n_);
+        Node* gb = bb.grad(b_n_);
+        if (!gW || !gb)
+            throw std::runtime_error("Dense::apply_sgd: missing gradient — did you seed autograd and call build({params...})?");
+        W_u_ = sgd_step(g, W_n_, gW, lr);
+        b_u_ = sgd_step(g, b_n_, gb, lr);
     }
 
+    // After SGD: pull updated parameters out of the executor and sync
+    // both the canonical W_/b_ and the InputNode's tensor (so the next
+    // run of the graph uploads fresh values).
     template <typename Exec>
     void refresh(Exec& exec) {
         W_ = exec.result(W_u_);
         b_ = exec.result(b_u_);
+        W_n_->tensor = W_;
+        b_n_->tensor = b_;
     }
 
 private:
-    Tensor W_, b_;
-    Node *W_n_ = nullptr, *b_n_ = nullptr;
-    Node *W_u_ = nullptr, *b_u_ = nullptr;
+    Tensor      W_, b_;
+    InputNode  *W_n_ = nullptr, *b_n_ = nullptr;
+    Node       *W_u_ = nullptr, *b_u_ = nullptr;
 };
 
 class Conv2D {
@@ -168,19 +185,25 @@ public:
 
     template <typename BB>
     void apply_sgd(ComputeGraph& g, BB& bb, float lr) {
-        K_u_ = sgd_step(g, K_n_, bb.grad(K_n_), lr);
+        if (!K_n_)
+            throw std::runtime_error("Conv2D::apply_sgd: layer not bound to a graph (call operator() first)");
+        Node* gK = bb.grad(K_n_);
+        if (!gK)
+            throw std::runtime_error("Conv2D::apply_sgd: missing kernel gradient — did you seed autograd and call build({K})?");
+        K_u_ = sgd_step(g, K_n_, gK, lr);
     }
 
     template <typename Exec>
     void refresh(Exec& exec) {
         K_ = exec.result(K_u_);
+        K_n_->tensor = K_;
     }
 
 private:
-    Tensor K_;
-    int    stride_, pad_;
-    Node  *K_n_ = nullptr;
-    Node  *K_u_ = nullptr;
+    Tensor      K_;
+    int         stride_, pad_;
+    InputNode  *K_n_ = nullptr;
+    Node       *K_u_ = nullptr;
 };
 
 } // namespace cg::nn

@@ -31,6 +31,9 @@ public:
     const std::string  device_name() const;
     const cg::Tensor&  result(cg::Node* node) const;  // implicitly flushes
     void               clear();                       // drop all results & buffers
+    // Reset between runs of the same graph — clears host result cache, but
+    // keeps device buffers alive so subsequent runs can reuse them.
+    void               reset();
 
 private:
     std::unique_ptr<MetalContext> ctx_;

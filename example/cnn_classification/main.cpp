@@ -1,5 +1,6 @@
-// MNIST CNN. Conv2D + Dense layers own their own parameters; the training
-// loop is a single cg::ComputeGraph executed on Metal.
+// MNIST CNN. ONE compute graph holds forward + backward + SGD update.
+// Eval runs a forward subgraph (g.accept(visitor, y)) — backward and SGD
+// nodes are skipped, parameters aren't modified.
 
 #include "cg.h"
 #include "nn.h"
@@ -20,14 +21,13 @@ using namespace cg;
 
 // ---- Model ---------------------------------------------------------------
 struct CNN {
-    nn::Conv2D conv1;   // 1 -> 8, 3x3, stride=2, pad=1   ->  [N, 8, 14, 14]
-    nn::Dense  fc;      // 1568 -> 10
+    nn::Conv2D conv1;
+    nn::Dense  fc;
 
     CNN(std::mt19937& rng)
         : conv1(/*in*/1, /*out*/8, /*kH*/3, /*kW*/3, /*stride*/2, /*pad*/1, rng)
         , fc(1568, 10, rng) {}
 
-    // Returns logits (pre-softmax)
     Node* forward(ComputeGraph& g, Node* x_flat, int batch) {
         auto* x4d  = g.emplace<ReshapeNode>(x_flat,
                        std::vector<int>{batch, 784},
@@ -56,118 +56,122 @@ struct CNN {
     void refresh(Exec& exec) { conv1.refresh(exec); fc.refresh(exec); }
 };
 
-// ---- Training step ------------------------------------------------------
-static std::pair<float, int>
-train_step(CNN& m, const Tensor& X, const std::vector<int>& Y, float lr,
-           metal::Executor& exec, bool print_graph)
-{
-    int batch = X.shape[0];
-    int n_cls = 10;
+// ---- Trainer: one persistent graph --------------------------------------
+struct Trainer {
+    static constexpr int batch = 64;
+    static constexpr int n_cls = 10;
 
+    CNN          model;
     ComputeGraph g;
-    auto* x      = g.emplace<InputNode>("X",  X);
-    auto* oh     = g.emplace<InputNode>("OH", mnist::one_hot(Y, n_cls));
+    InputNode   *X_in  = nullptr;
+    InputNode   *OH_in = nullptr;
+    Node        *y     = nullptr;
 
-    auto* logits = m.forward(g, x, batch);
-    auto* y      = nn::softmax(g, logits);
+    Trainer(std::mt19937& rng, float lr) : model(rng) {
+        X_in  = g.emplace<InputNode>("X",  Tensor({batch, 784}));
+        OH_in = g.emplace<InputNode>("OH", Tensor({batch, n_cls}));
 
-    auto* dz = nn::softmax_ce_backward(g, y, oh, batch);
-    autograd::BackwardBuilder bb(g);
-    bb.seed(logits, dz);
-    bb.build(m.params());
+        auto* logits = model.forward(g, X_in, batch);
+        y = nn::softmax(g, logits);
 
-    m.apply_sgd(g, bb, lr);
-
-    if (print_graph) {
-        std::cout << "--- TRAIN GRAPH ---\n";
-        PrintVisitor p; g.accept(p); std::cout << "\n";
+        auto* dz = nn::softmax_ce_backward(g, y, OH_in, batch);
+        autograd::BackwardBuilder bb(g);
+        bb.seed(logits, dz);
+        bb.build(model.params());
+        model.apply_sgd(g, bb, lr);
     }
+};
 
-    exec.clear(); g.accept(exec);
+static void fill_train_batch(Trainer& t, const mnist::Dataset& tr,
+                             const std::vector<int>& idx, int b_off)
+{
+    std::fill(t.OH_in->tensor.data.begin(), t.OH_in->tensor.data.end(), 0.0f);
+    for (int i = 0; i < Trainer::batch; ++i) {
+        int s = idx[b_off + i];
+        std::memcpy(t.X_in->tensor.data.data() + i * 784,
+                    tr.images.data.data()      + s * 784,
+                    784 * sizeof(float));
+        t.OH_in->tensor.data[i * Trainer::n_cls + tr.labels[s]] = 1.0f;
+    }
+}
 
-    const Tensor& y_v = exec.result(y);
+static std::pair<float, int>
+loss_and_acc(const Tensor& y, const std::vector<int>& Y) {
     float loss = 0.0f; int correct = 0;
-    for (int i = 0; i < batch; ++i) {
-        const float* row = y_v.data.data() + i * n_cls;
+    for (int i = 0; i < Trainer::batch; ++i) {
+        const float* row = y.data.data() + i * Trainer::n_cls;
         loss -= std::log(std::max(row[Y[i]], 1e-9f));
         int pred = 0;
-        for (int j = 1; j < n_cls; ++j) if (row[j] > row[pred]) pred = j;
+        for (int j = 1; j < Trainer::n_cls; ++j) if (row[j] > row[pred]) pred = j;
         if (pred == Y[i]) ++correct;
     }
-    loss /= batch;
-
-    m.refresh(exec);
-    return {loss, correct};
+    return {loss / Trainer::batch, correct};
 }
 
-static float evaluate(CNN& m, const Tensor& X, const std::vector<int>& Y, metal::Executor& exec) {
-    int batch = X.shape[0];
-    int n_cls = 10;
-
-    ComputeGraph g;
-    auto* x      = g.emplace<InputNode>("X", X);
-    auto* logits = m.forward(g, x, batch);
-    auto* y      = nn::softmax(g, logits);
-
-    exec.clear(); g.accept(exec);
-    const Tensor& yv = exec.result(y);
-
-    int correct = 0;
-    for (int i = 0; i < batch; ++i) {
-        const float* row = yv.data.data() + i * n_cls;
-        int pred = 0;
-        for (int j = 1; j < n_cls; ++j) if (row[j] > row[pred]) pred = j;
-        if (pred == Y[i]) ++correct;
+static float evaluate(Trainer& t, const mnist::Dataset& te, metal::Executor& exec) {
+    int n = (int)te.labels.size();
+    int correct = 0, total = 0;
+    for (int b = 0; b + Trainer::batch <= n; b += Trainer::batch) {
+        std::memcpy(t.X_in->tensor.data.data(),
+                    te.images.data.data() + b * 784,
+                    Trainer::batch * 784 * sizeof(float));
+        exec.reset();
+        t.g.accept(exec, t.y);              // forward subgraph only
+        const Tensor& yv = exec.result(t.y);
+        for (int i = 0; i < Trainer::batch; ++i) {
+            const float* row = yv.data.data() + i * Trainer::n_cls;
+            int pred = 0;
+            for (int j = 1; j < Trainer::n_cls; ++j) if (row[j] > row[pred]) pred = j;
+            if (pred == te.labels[b + i]) ++correct;
+        }
+        total += Trainer::batch;
     }
-    return (float)correct / batch;
+    return (float)correct / total;
 }
 
-// ---- Main ---------------------------------------------------------------
 int main() {
     std::cout << "Loading MNIST...\n";
     auto tr = mnist::load_train();
     auto te = mnist::load_test();
     std::cout << "  train: " << tr.labels.size() << "  test: " << te.labels.size() << "\n";
 
-    constexpr int   batch_size = 64;
-    constexpr int   n_epochs   = 3;
-    constexpr float lr         = 0.1f;
+    constexpr int   n_epochs = 3;
+    constexpr float lr       = 0.1f;
 
     std::mt19937 rng(42);
-    CNN model(rng);
+    Trainer trainer(rng, lr);
     metal::Executor exec;
     std::cout << "[Metal] device: " << exec.device_name() << "\n\n";
 
     int n = (int)tr.labels.size();
     std::vector<int> idx(n);
     for (int i = 0; i < n; ++i) idx[i] = i;
-    bool printed = false;
 
     for (int epoch = 0; epoch < n_epochs; ++epoch) {
         std::shuffle(idx.begin(), idx.end(), rng);
         float loss = 0.0f; int correct = 0, batches = 0;
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        for (int b = 0; b + batch_size <= n; b += batch_size) {
-            Tensor X({batch_size, 784});
-            std::vector<int> Y(batch_size);
-            for (int i = 0; i < batch_size; ++i) {
-                int s = idx[b + i];
-                std::memcpy(X.data.data() + i * 784,
-                            tr.images.data.data() + s * 784, 784 * sizeof(float));
-                Y[i] = tr.labels[s];
-            }
-            auto [l, c] = train_step(model, X, Y, lr, exec, !printed);
-            printed = true;
+        for (int b = 0; b + Trainer::batch <= n; b += Trainer::batch) {
+            fill_train_batch(trainer, tr, idx, b);
+
+            exec.reset();
+            trainer.g.accept(exec);
+
+            std::vector<int> Y(Trainer::batch);
+            for (int i = 0; i < Trainer::batch; ++i) Y[i] = tr.labels[idx[b + i]];
+            auto [l, c] = loss_and_acc(exec.result(trainer.y), Y);
             loss += l; correct += c; ++batches;
+
+            trainer.model.refresh(exec);
         }
         double secs = std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now() - t0).count();
-        float test_acc = evaluate(model, te.images, te.labels, exec);
+        float test_acc = evaluate(trainer, te, exec);
 
         std::cout << "epoch " << (epoch + 1) << "/" << n_epochs
                   << "  loss "      << (loss / batches)
-                  << "  train_acc " << (100.0f * correct / (batches * batch_size)) << "%"
+                  << "  train_acc " << (100.0f * correct / (batches * Trainer::batch)) << "%"
                   << "  test_acc "  << (100.0f * test_acc) << "%"
                   << "  ("          << secs << "s)\n";
     }

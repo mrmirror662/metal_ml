@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+build-*/
+cmake-build-*/
+
+# Auto-downloaded third-party
+third_party/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Compiler / clangd
+compile_commands.json
+.cache/
+
+# Local CMake state files (not project state)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile

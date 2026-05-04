@@ -1,0 +1,2 @@
+#pragma once
+#define CG_METAL_SHADER_LIB "@SHADER_LIB@"

@@ -12,6 +12,7 @@
 
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -19,9 +20,20 @@
 
 namespace cg::metal {
 
+// RAII handle for an MTL::Buffer. Custom-deleter shared_ptr means:
+//   * release() runs exactly once when the last owner drops
+//   * copy = retain (extra owner), no manual retain/release pairs to balance
+//   * reshape's "alias same buffer under two nodes" becomes shared ownership,
+//     so dangling-after-realloc is structurally impossible
+using MtlBufferPtr = std::shared_ptr<MTL::Buffer>;
+
+static MtlBufferPtr wrap_buffer(MTL::Buffer* raw) {
+    return MtlBufferPtr(raw, [](MTL::Buffer* b) { if (b) b->release(); });
+}
+
 // --- Device-side tensor: a buffer on the GPU plus its logical shape ---
 struct MetalBuffer {
-    MTL::Buffer*     buf = nullptr;
+    MtlBufferPtr     buf;
     std::vector<int> shape;
 
     int numel() const {
@@ -44,8 +56,8 @@ struct MetalContext {
 
     ~MetalContext() {
         if (pending) { pending->commit(); pending->waitUntilCompleted(); }
-        for (auto& [_, mb]  : device_results) if (mb.buf) mb.buf->release();
-        for (auto& [_, pso] : psos)           pso->release();
+        // device_results' MtlBufferPtrs release themselves as the map clears.
+        for (auto& [_, pso] : psos) pso->release();
         if (library) library->release();
         if (queue)   queue->release();
         if (device)  device->release();
@@ -78,24 +90,23 @@ static MetalBuffer& ensure_output(MetalContext& ctx, cg::Node* node, std::vector
     if (it != ctx.device_results.end()) {
         MetalBuffer& mb = it->second;
         if (mb.shape == shape) return mb;
-        // Shape changed (e.g. variable batch size) — reallocate to avoid
-        // OOB writes against a stale-sized buffer.
-        if (mb.buf) mb.buf->release();
+        // Shape changed (e.g. variable batch size) — drop the old buffer
+        // (any aliased reshape views drop with it via shared_ptr) and realloc.
         mb.shape = std::move(shape);
-        mb.buf = ctx.device->newBuffer(numel * sizeof(float), MTL::ResourceStorageModeShared);
+        mb.buf = wrap_buffer(ctx.device->newBuffer(numel * sizeof(float), MTL::ResourceStorageModeShared));
         ctx.host_cache.erase(node);
         return mb;
     }
     MetalBuffer mb;
     mb.shape = std::move(shape);
-    mb.buf = ctx.device->newBuffer(numel * sizeof(float), MTL::ResourceStorageModeShared);
+    mb.buf = wrap_buffer(ctx.device->newBuffer(numel * sizeof(float), MTL::ResourceStorageModeShared));
     auto [iter, _] = ctx.device_results.emplace(node, std::move(mb));
     return iter->second;
 }
 
 static cg::Tensor from_device(const MetalBuffer& mb) {
     cg::Tensor t(mb.shape);
-    std::memcpy(t.data.data(), mb.buf->contents(), mb.numel() * sizeof(float));
+    std::memcpy(t.data(), mb.buf->contents(), mb.numel() * sizeof(float));
     return t;
 }
 
@@ -155,7 +166,7 @@ static void dispatch_elementwise(
     dispatch(ctx, lookup_pso(ctx, kernel), [&](MTL::ComputeCommandEncoder* enc) {
         int slot = 0;
         for (auto* in : inputs)  enc->setBuffer(in, 0, slot++);
-        enc->setBuffer(out.buf, 0, slot++);
+        enc->setBuffer(out.buf.get(), 0, slot++);
         enc->setBytes(&numel, sizeof(uint32_t), slot++);
         for (auto& c : extras)   enc->setBytes(c.data, c.size, slot++);
     }, grid, threadgroup);
@@ -205,31 +216,25 @@ const std::string Executor::device_name() const {
 // ---------- Visit methods ----------
 
 void Executor::visit(cg::InputNode& node) {
-    if ((int)node.tensor.data.size() != node.tensor.numel())
-        throw std::runtime_error("Metal InputNode: tensor data size != numel for '" + node.name + "'");
-
     size_t bytes = node.tensor.numel() * sizeof(float);
     auto it = ctx_->device_results.find(&node);
     if (it != ctx_->device_results.end()) {
         MetalBuffer& mb = it->second;
-        // Reupload only valid if shape (and therefore size) is unchanged. If
-        // someone reassigned `node.tensor` to a differently-shaped tensor we'd
-        // memcpy past the end of the GPU buffer — reallocate instead.
-        if (mb.shape != node.tensor.shape) {
-            if (mb.buf) mb.buf->release();
-            mb.shape = node.tensor.shape;
-            mb.buf = ctx_->device->newBuffer(node.tensor.data.data(), bytes,
-                                             MTL::ResourceStorageModeShared);
+        // Reupload only valid if shape (and therefore size) is unchanged.
+        if (mb.shape != node.tensor.shape()) {
+            mb.shape = node.tensor.shape();
+            mb.buf   = wrap_buffer(ctx_->device->newBuffer(
+                node.tensor.data(), bytes, MTL::ResourceStorageModeShared));
             ctx_->host_cache.erase(&node);
             return;
         }
-        std::memcpy(mb.buf->contents(), node.tensor.data.data(), bytes);
+        std::memcpy(mb.buf->contents(), node.tensor.data(), bytes);
         return;
     }
     MetalBuffer mb;
-    mb.shape = node.tensor.shape;
-    mb.buf = ctx_->device->newBuffer(node.tensor.data.data(), bytes,
-                                     MTL::ResourceStorageModeShared);
+    mb.shape = node.tensor.shape();
+    mb.buf = wrap_buffer(ctx_->device->newBuffer(
+        node.tensor.data(), bytes, MTL::ResourceStorageModeShared));
     ctx_->device_results.emplace(&node, std::move(mb));
 }
 
@@ -240,7 +245,7 @@ void Executor::visit(cg::MatAddNode& node) {
         throw std::runtime_error("Metal MatAdd: shape mismatch");
 
     MetalBuffer& C = ensure_output(*ctx_, &node, A.shape);
-    dispatch_elementwise(*ctx_, "mat_add", C, {A.buf, B.buf});
+    dispatch_elementwise(*ctx_, "mat_add", C, {A.buf.get(), B.buf.get()});
 }
 
 void Executor::visit(cg::HadamardNode& node) {
@@ -250,7 +255,7 @@ void Executor::visit(cg::HadamardNode& node) {
         throw std::runtime_error("Metal Hadamard: shape mismatch");
 
     MetalBuffer& C = ensure_output(*ctx_, &node, A.shape);
-    dispatch_elementwise(*ctx_, "hadamard", C, {A.buf, B.buf});
+    dispatch_elementwise(*ctx_, "hadamard", C, {A.buf.get(), B.buf.get()});
 }
 
 void Executor::visit(cg::MapNode& node) {
@@ -259,10 +264,10 @@ void Executor::visit(cg::MapNode& node) {
 
     switch (node.op) {
         case cg::MapOp::ReLU:
-            dispatch_elementwise(*ctx_, "relu", out, {in.buf});
+            dispatch_elementwise(*ctx_, "relu", out, {in.buf.get()});
             break;
         case cg::MapOp::Step:
-            dispatch_elementwise(*ctx_, "step_op", out, {in.buf});
+            dispatch_elementwise(*ctx_, "step_op", out, {in.buf.get()});
             break;
         case cg::MapOp::Softmax: {
             int last = in.shape.back();
@@ -273,8 +278,8 @@ void Executor::visit(cg::MapNode& node) {
             MTL::Size grid        = MTL::Size((rows + 255) / 256, 1, 1);
 
             dispatch(*ctx_, lookup_pso(*ctx_, "softmax_lastdim"), [&](MTL::ComputeCommandEncoder* enc) {
-                enc->setBuffer(in.buf,  0, 0);
-                enc->setBuffer(out.buf, 0, 1);
+                enc->setBuffer(in.buf.get(),  0, 0);
+                enc->setBuffer(out.buf.get(), 0, 1);
                 enc->setBytes(&rows, sizeof(uint32_t), 2);
                 enc->setBytes(&cols, sizeof(uint32_t), 3);
             }, grid, threadgroup);
@@ -286,7 +291,7 @@ void Executor::visit(cg::MapNode& node) {
 void Executor::visit(cg::ScaleNode& node) {
     const MetalBuffer& in = ctx_->device_results.at(node.input);
     MetalBuffer& out = ensure_output(*ctx_, &node, in.shape);
-    dispatch_elementwise(*ctx_, "scale", out, {in.buf}, {{&node.scalar, sizeof(float)}});
+    dispatch_elementwise(*ctx_, "scale", out, {in.buf.get()}, {{&node.scalar, sizeof(float)}});
 }
 
 void Executor::visit(cg::MatMulNode& node) {
@@ -339,9 +344,9 @@ void Executor::visit(cg::MatMulNode& node) {
     }
 
     dispatch(*ctx_, lookup_pso(*ctx_, kernel), [&](MTL::ComputeCommandEncoder* enc) {
-        enc->setBuffer(A.buf, 0, 0);
-        enc->setBuffer(B.buf, 0, 1);
-        enc->setBuffer(C.buf, 0, 2);
+        enc->setBuffer(A.buf.get(), 0, 0);
+        enc->setBuffer(B.buf.get(), 0, 1);
+        enc->setBuffer(C.buf.get(), 0, 2);
         enc->setBytes(&M, sizeof(uint32_t), 3);
         enc->setBytes(&N, sizeof(uint32_t), 4);
         enc->setBytes(&K, sizeof(uint32_t), 5);
@@ -370,8 +375,8 @@ void Executor::visit(cg::ReduceNode& node) {
     MTL::Size grid        = MTL::Size((total_out + 255) / 256, 1, 1);
 
     dispatch(*ctx_, lookup_pso(*ctx_, "reduce_axis"), [&](MTL::ComputeCommandEncoder* enc) {
-        enc->setBuffer(in.buf,  0, 0);
-        enc->setBuffer(out.buf, 0, 1);
+        enc->setBuffer(in.buf.get(),  0, 0);
+        enc->setBuffer(out.buf.get(), 0, 1);
         enc->setBytes(&outer,     sizeof(uint32_t), 2);
         enc->setBytes(&axis_size, sizeof(uint32_t), 3);
         enc->setBytes(&inner,     sizeof(uint32_t), 4);
@@ -407,8 +412,8 @@ void Executor::visit(cg::TransposeNode& node) {
     MTL::Size grid        = MTL::Size((numel_u + 255) / 256, 1, 1);
 
     dispatch(*ctx_, lookup_pso(*ctx_, "transpose_nd"), [&](MTL::ComputeCommandEncoder* enc) {
-        enc->setBuffer(in.buf,  0, 0);
-        enc->setBuffer(out.buf, 0, 1);
+        enc->setBuffer(in.buf.get(),  0, 0);
+        enc->setBuffer(out.buf.get(), 0, 1);
         enc->setBytes(in_shape_u.data(),  in_shape_u.size()  * sizeof(uint32_t), 2);
         enc->setBytes(out_shape_u.data(), out_shape_u.size() * sizeof(uint32_t), 3);
         enc->setBytes(perm_u.data(),      perm_u.size()      * sizeof(uint32_t), 4);
@@ -440,8 +445,8 @@ void Executor::visit(cg::BroadcastNode& node) {
     MTL::Size grid        = MTL::Size((numel + 255) / 256, 1, 1);
 
     dispatch(*ctx_, lookup_pso(*ctx_, "broadcast_axis"), [&](MTL::ComputeCommandEncoder* enc) {
-        enc->setBuffer(in.buf,  0, 0);
-        enc->setBuffer(out.buf, 0, 1);
+        enc->setBuffer(in.buf.get(),  0, 0);
+        enc->setBuffer(out.buf.get(), 0, 1);
         enc->setBytes(shape_u.data(), shape_u.size() * sizeof(uint32_t), 2);
         enc->setBytes(&ndim_u, sizeof(uint32_t), 3);
         enc->setBytes(&axis_u, sizeof(uint32_t), 4);
@@ -458,20 +463,17 @@ void Executor::visit(cg::ReshapeNode& node) {
 
     auto it = ctx_->device_results.find(&node);
     if (it != ctx_->device_results.end()) {
-        // Already shares the input's buffer from a prior run; nothing to do
-        // unless the input's buffer pointer changed (shouldn't, with stable graph).
-        if (it->second.buf != in.buf) {
-            it->second.buf->release();
-            it->second.buf = in.buf;
-            in.buf->retain();
-        }
+        // If the input's buffer was reallocated (e.g. shape change), refresh
+        // the alias. Shared ownership: the old buffer drops automatically
+        // when no other view holds it.
+        if (it->second.buf.get() != in.buf.get()) it->second.buf = in.buf;
+        it->second.shape = node.new_shape;
         return;
     }
-    // First time: zero-copy view via retain
+    // First time: zero-copy view — both nodes share ownership of the buffer.
     MetalBuffer out;
     out.shape = node.new_shape;
     out.buf   = in.buf;
-    in.buf->retain();
     ctx_->device_results.emplace(&node, std::move(out));
 }
 
@@ -511,8 +513,8 @@ void Executor::visit(cg::Im2ColNode& node) {
     MTL::Size grid        = MTL::Size((total + 255) / 256, 1, 1);
 
     dispatch(*ctx_, lookup_pso(*ctx_, "im2col"), [&](MTL::ComputeCommandEncoder* enc) {
-        enc->setBuffer(X.buf,   0, 0);
-        enc->setBuffer(out.buf, 0, 1);
+        enc->setBuffer(X.buf.get(),   0, 0);
+        enc->setBuffer(out.buf.get(), 0, 1);
         bind_im2col_args(enc, N, C, H, W, kH, kW, s, p, Hout, Wout);
     }, grid, threadgroup);
 }
@@ -533,8 +535,8 @@ void Executor::visit(cg::Col2ImNode& node) {
     MTL::Size grid        = MTL::Size((out.numel() + 255) / 256, 1, 1);
 
     dispatch(*ctx_, lookup_pso(*ctx_, "col2im"), [&](MTL::ComputeCommandEncoder* enc) {
-        enc->setBuffer(In.buf,  0, 0);
-        enc->setBuffer(out.buf, 0, 1);
+        enc->setBuffer(In.buf.get(),  0, 0);
+        enc->setBuffer(out.buf.get(), 0, 1);
         bind_im2col_args(enc, N, C, H, W, kH, kW, s, p, Hout, Wout);
     }, grid, threadgroup);
 }
@@ -563,9 +565,7 @@ void Executor::reset() {
 
 void Executor::clear() {
     ctx_->flush();
-    for (auto& [_, mb] : ctx_->device_results)
-        if (mb.buf) mb.buf->release();
-    ctx_->device_results.clear();
+    ctx_->device_results.clear();   // shared_ptr deleters release MTL buffers
     ctx_->host_cache.clear();
 }
 

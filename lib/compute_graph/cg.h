@@ -1,6 +1,7 @@
 #pragma once
 #include <memory>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -11,23 +12,48 @@ namespace cg {
 std::string version();
 
 // --- Tensor ---
-struct Tensor {
-    std::vector<int>   shape;
-    std::vector<int>   strides;  // element strides, row-major
-    std::vector<float> data;
-
+//
+// Owns a contiguous float buffer with a logical shape. Once constructed the
+// shape is fixed: there is no resize() or reshape() that mutates in place,
+// because those would let the shape/data invariant drift silently. To change
+// the shape you build a new Tensor.
+//
+// Element data is freely mutable through data(), operator[], or range-for.
+// Field access (`t.shape`, `t.data[i]`) is intentionally *not* offered —
+// those forms made it possible to reassign t.shape without resizing data,
+// which is exactly the class of bug this encapsulation removes.
+class Tensor {
+public:
     Tensor() = default;
     explicit Tensor(std::vector<int> shape);                        // zero-initialized
     Tensor(std::vector<int> shape, std::vector<float> data);
 
-    int ndim()  const { return (int)shape.size(); }
-    int numel() const;
+    const std::vector<int>& shape()   const { return shape_; }
+    const std::vector<int>& strides() const { return strides_; }
+    int  ndim()  const { return (int)shape_.size(); }
+    int  numel() const { return (int)data_.size(); }
 
-    // multi-index element access
+    // Bulk data access. The buffer size is fixed; do not resize through these.
+    float*       data()       { return data_.data(); }
+    const float* data() const { return data_.data(); }
+    float*       begin()       { return data_.data(); }
+    float*       end()         { return data_.data() + data_.size(); }
+    const float* begin() const { return data_.data(); }
+    const float* end()   const { return data_.data() + data_.size(); }
+
+    float&       operator[](int i)       { return data_[i]; }
+    float        operator[](int i) const { return data_[i]; }
+
+    // Multi-index element access — bounds checked.
     float&       at(const std::vector<int>& idx);
     float        at(const std::vector<int>& idx) const;
 
     static std::vector<int> make_strides(const std::vector<int>& shape);
+
+private:
+    std::vector<int>   shape_;
+    std::vector<int>   strides_;  // element strides, row-major
+    std::vector<float> data_;
 };
 
 // --- Enums ---
@@ -74,6 +100,21 @@ public:
     virtual std::vector<Node*> inputs() const { return {}; }
 };
 
+// Non-null Node*. Validates at construction so a null edge can never enter
+// the graph. Implicit conversions in/out keep call-site code unchanged
+// (g.emplace<MatMulNode>(x, W) continues to compile).
+class NodeRef {
+public:
+    NodeRef(Node* p) : ptr_(p) {
+        if (!p) throw std::runtime_error("NodeRef: input edge is null");
+    }
+    Node* get()        const { return ptr_; }
+    operator Node*()   const { return ptr_; }
+    Node* operator->() const { return ptr_; }
+private:
+    Node* ptr_;
+};
+
 // --- Concrete Nodes ---
 class InputNode : public Node {
 public:
@@ -87,7 +128,7 @@ public:
 
 class MatMulNode : public Node {
 public:
-    MatMulNode(Node* lhs, Node* rhs) : lhs(lhs), rhs(rhs) {}
+    MatMulNode(NodeRef lhs, NodeRef rhs) : lhs(lhs), rhs(rhs) {}
     void accept(Visitor& v) override { v.visit(*this); }
     std::vector<Node*> inputs() const override { return {lhs, rhs}; }
 
@@ -97,7 +138,7 @@ public:
 
 class MatAddNode : public Node {
 public:
-    MatAddNode(Node* lhs, Node* rhs) : lhs(lhs), rhs(rhs) {}
+    MatAddNode(NodeRef lhs, NodeRef rhs) : lhs(lhs), rhs(rhs) {}
     void accept(Visitor& v) override { v.visit(*this); }
     std::vector<Node*> inputs() const override { return {lhs, rhs}; }
 
@@ -107,7 +148,7 @@ public:
 
 class HadamardNode : public Node {  // element-wise multiply, same shape
 public:
-    HadamardNode(Node* lhs, Node* rhs) : lhs(lhs), rhs(rhs) {}
+    HadamardNode(NodeRef lhs, NodeRef rhs) : lhs(lhs), rhs(rhs) {}
     void accept(Visitor& v) override { v.visit(*this); }
     std::vector<Node*> inputs() const override { return {lhs, rhs}; }
 
@@ -117,7 +158,7 @@ public:
 
 class MapNode : public Node {
 public:
-    MapNode(Node* input, MapOp op) : input(input), op(op) {}
+    MapNode(NodeRef input, MapOp op) : input(input), op(op) {}
     void accept(Visitor& v) override { v.visit(*this); }
     std::vector<Node*> inputs() const override { return {input}; }
 
@@ -127,7 +168,7 @@ public:
 
 class ScaleNode : public Node {
 public:
-    ScaleNode(Node* input, float scalar) : input(input), scalar(scalar) {}
+    ScaleNode(NodeRef input, float scalar) : input(input), scalar(scalar) {}
     void accept(Visitor& v) override { v.visit(*this); }
     std::vector<Node*> inputs() const override { return {input}; }
 
@@ -137,7 +178,7 @@ public:
 
 class ReduceNode : public Node {
 public:
-    ReduceNode(Node* input, ReduceOp op, int axis)
+    ReduceNode(NodeRef input, ReduceOp op, int axis)
         : input(input), op(op), axis(axis) {}
     void accept(Visitor& v) override { v.visit(*this); }
     std::vector<Node*> inputs() const override { return {input}; }
@@ -151,7 +192,7 @@ class TransposeNode : public Node {
 public:
     // perm: full permutation of dims, e.g. {0,2,1,3} for a 4D tensor.
     // empty perm = swap last two dims.
-    explicit TransposeNode(Node* input, std::vector<int> perm = {})
+    explicit TransposeNode(NodeRef input, std::vector<int> perm = {})
         : input(input), perm(std::move(perm)) {}
     void accept(Visitor& v) override { v.visit(*this); }
     std::vector<Node*> inputs() const override { return {input}; }
@@ -164,7 +205,7 @@ public:
 // e.g. [1, hidden] with axis=0, count=batch -> [batch, hidden].
 class BroadcastNode : public Node {
 public:
-    BroadcastNode(Node* input, int axis, int count)
+    BroadcastNode(NodeRef input, int axis, int count)
         : input(input), axis(axis), count(count) {}
     void accept(Visitor& v) override { v.visit(*this); }
     std::vector<Node*> inputs() const override { return {input}; }
@@ -179,7 +220,7 @@ public:
 // reshape without needing static shape inference.
 class ReshapeNode : public Node {
 public:
-    ReshapeNode(Node* input, std::vector<int> input_shape, std::vector<int> new_shape)
+    ReshapeNode(NodeRef input, std::vector<int> input_shape, std::vector<int> new_shape)
         : input(input), input_shape(std::move(input_shape)), new_shape(std::move(new_shape)) {}
     void accept(Visitor& v) override { v.visit(*this); }
     std::vector<Node*> inputs() const override { return {input}; }
@@ -194,7 +235,7 @@ public:
 // Hout = (H + 2*pad - kH) / stride + 1, similarly Wout.
 class Im2ColNode : public Node {
 public:
-    Im2ColNode(Node* input, std::vector<int> input_shape,
+    Im2ColNode(NodeRef input, std::vector<int> input_shape,
                int kH, int kW, int stride, int pad)
         : input(input), input_shape(std::move(input_shape)),
           kH(kH), kW(kW), stride(stride), pad(pad) {}
@@ -212,7 +253,7 @@ public:
 // depends on the original spatial dims.
 class Col2ImNode : public Node {
 public:
-    Col2ImNode(Node* input, std::vector<int> output_shape, int kH, int kW, int stride, int pad)
+    Col2ImNode(NodeRef input, std::vector<int> output_shape, int kH, int kW, int stride, int pad)
         : input(input), output_shape(std::move(output_shape)),
           kH(kH), kW(kW), stride(stride), pad(pad) {}
     void accept(Visitor& v) override { v.visit(*this); }

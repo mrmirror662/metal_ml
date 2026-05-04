@@ -12,7 +12,7 @@ static cg::Tensor random_tensor(std::vector<int> shape, unsigned seed = 42,
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> dist(lo, hi);
     cg::Tensor t(shape);
-    for (auto& v : t.data) v = dist(rng);
+    for (auto& v : t) v = dist(rng);
     return t;
 }
 
@@ -36,18 +36,18 @@ static double time_run(cg::ComputeGraph& g, Exec& exec) {
 static double max_abs_diff(const cg::Tensor& a, const cg::Tensor& b) {
     double m = 0.0;
     for (int i = 0; i < a.numel(); ++i)
-        m = std::max(m, (double)std::abs(a.data[i] - b.data[i]));
+        m = std::max(m, (double)std::abs(a[i] - b[i]));
     return m;
 }
 
 static void print_softmax_preview(const cg::Tensor& t, int n_rows = 5) {
-    int cols = t.shape.back();
+    int cols = t.shape().back();
     for (int r = 0; r < n_rows && r * cols < t.numel(); ++r) {
         std::cout << "    row " << r << ": ";
         float sum = 0.0f;
         for (int c = 0; c < cols; ++c) {
-            std::cout << t.data[r * cols + c] << " ";
-            sum += t.data[r * cols + c];
+            std::cout << t[r * cols + c] << " ";
+            sum += t[r * cols + c];
         }
         std::cout << "(sum=" << sum << ")\n";
     }
@@ -114,17 +114,17 @@ int main() {
         std::cout << label << ": " << ms << " ms"
                   << "  (speedup " << (cpu_ms / ms) << "x"
                   << ", max_abs_diff " << diff << ")\n";
-        std::cout << "    softmax " << shape_str(gpu_probs.shape) << " (first 5 rows):\n";
+        std::cout << "    softmax " << shape_str(gpu_probs.shape()) << " (first 5 rows):\n";
         print_softmax_preview(gpu_probs);
         return ms;
     };
 
     cg::metal::Executor probe(cg::metal::Executor::MatMul::Naive);
     std::cout << "[Metal] device: " << probe.device_name() << "\n";
-    std::cout << "matmul output shape: " << shape_str(cpu_out.shape) << "\n\n";
+    std::cout << "matmul output shape: " << shape_str(cpu_out.shape()) << "\n\n";
 
     std::cout << "CPU              : " << cpu_ms << " ms\n";
-    std::cout << "    softmax " << shape_str(cpu_probs.shape) << " (first 5 rows):\n";
+    std::cout << "    softmax " << shape_str(cpu_probs.shape()) << " (first 5 rows):\n";
     print_softmax_preview(cpu_probs);
     std::cout << "\n";
 

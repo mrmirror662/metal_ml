@@ -23,10 +23,10 @@ using namespace cg;
 // =============================================================================
 
 static double max_abs_diff(const Tensor& a, const Tensor& b) {
-    EXPECT_TRUE(a.shape == b.shape);
+    EXPECT_TRUE(a.shape() == b.shape());
     double m = 0.0;
     for (int i = 0; i < a.numel(); ++i)
-        m = std::max(m, (double)std::abs(a.data[i] - b.data[i]));
+        m = std::max(m, (double)std::abs(a[i] - b[i]));
     return m;
 }
 
@@ -38,7 +38,7 @@ static Tensor random_tensor(std::vector<int> shape, unsigned seed) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
     Tensor t(shape);
-    for (auto& v : t.data) v = dist(rng);
+    for (auto& v : t) v = dist(rng);
     return t;
 }
 
@@ -64,11 +64,11 @@ static Tensor run_metal(Build build) {
 template <typename Build>
 static void check_cpu_and_metal(Build build, const Tensor& expected, double tol = 1e-5) {
     Tensor cpu = run_cpu(build);
-    EXPECT_TRUE(cpu.shape == expected.shape);
+    EXPECT_TRUE(cpu.shape() == expected.shape());
     EXPECT_NEAR(max_abs_diff(cpu, expected), 0.0, tol);
 
     Tensor met = run_metal(build);
-    EXPECT_TRUE(met.shape == cpu.shape);
+    EXPECT_TRUE(met.shape() == cpu.shape());
     EXPECT_NEAR(max_abs_diff(met, cpu), 0.0, tol);
 }
 
@@ -79,7 +79,7 @@ static void check_cpu_and_metal(Build build, const Tensor& expected, double tol 
 TEST(tensor_numel_and_strides) {
     Tensor t({2, 3, 4});
     EXPECT_TRUE(t.numel() == 24);
-    EXPECT_TRUE(t.strides == std::vector<int>({12, 4, 1}));
+    EXPECT_TRUE(t.strides() == std::vector<int>({12, 4, 1}));
 }
 
 // =============================================================================
@@ -163,7 +163,7 @@ TEST(map_softmax_rows_sum_to_one) {
     });
     for (int r = 0; r < 4; ++r) {
         float sum = 0.0f;
-        for (int c = 0; c < 6; ++c) sum += cpu.data[r * 6 + c];
+        for (int c = 0; c < 6; ++c) sum += cpu[r * 6 + c];
         EXPECT_NEAR(sum, 1.0, 1e-5);
     }
     Tensor met = run_metal([&](ComputeGraph& g) {
@@ -214,9 +214,9 @@ TEST(transpose_3d_perm) {
     Tensor cpu = run_cpu([&](ComputeGraph& g) {
         return g.emplace<TransposeNode>(g.emplace<InputNode>("x", X), std::vector<int>{0, 2, 1});
     });
-    EXPECT_TRUE(cpu.shape == std::vector<int>({2, 4, 3}));
+    EXPECT_TRUE(cpu.shape() == std::vector<int>({2, 4, 3}));
     // Spot-check: cpu[a, b, c] should equal X[a, c, b]
-    EXPECT_NEAR(cpu.data[(0 * 4 + 2) * 3 + 1], X.data[(0 * 3 + 1) * 4 + 2], 1e-6);
+    EXPECT_NEAR(cpu[(0 * 4 + 2) * 3 + 1], X[(0 * 3 + 1) * 4 + 2], 1e-6);
 
     Tensor met = run_metal([&](ComputeGraph& g) {
         return g.emplace<TransposeNode>(g.emplace<InputNode>("x", X), std::vector<int>{0, 2, 1});
@@ -250,10 +250,10 @@ TEST(im2col_basic) {
         return g.emplace<Im2ColNode>(g.emplace<InputNode>("x", X),
             std::vector<int>{1, 1, 2, 2}, 2, 2, 1, 0);
     });
-    EXPECT_TRUE(cpu.shape == std::vector<int>({1, 4}));
+    EXPECT_TRUE(cpu.shape() == std::vector<int>({1, 4}));
     // The single patch is the whole image
-    EXPECT_NEAR(cpu.data[0], 1, 1e-6);
-    EXPECT_NEAR(cpu.data[3], 4, 1e-6);
+    EXPECT_NEAR(cpu[0], 1, 1e-6);
+    EXPECT_NEAR(cpu[3], 4, 1e-6);
 
     Tensor met = run_metal([&](ComputeGraph& g) {
         return g.emplace<Im2ColNode>(g.emplace<InputNode>("x", X),
@@ -286,7 +286,7 @@ TEST(conv2d_forward_parity) {
             std::vector<int>{4, 3, 3, 3}, 1, 1);
     };
     Tensor cpu = run_cpu(build);
-    EXPECT_TRUE(cpu.shape == std::vector<int>({2, 4, 8, 8}));
+    EXPECT_TRUE(cpu.shape() == std::vector<int>({2, 4, 8, 8}));
     Tensor met = run_metal(build);
     EXPECT_NEAR(max_abs_diff(cpu, met), 0.0, 1e-5);
 }
@@ -304,14 +304,14 @@ static Tensor analytical_grad(Build build, const Tensor& X) {
     Node* out0 = build(g0, x0);
     cpu::Executor e0;
     g0.accept(e0);
-    auto out_shape = e0.result(out0).shape;
+    auto out_shape = e0.result(out0).shape();
 
     // Build with autograd, seed with ones (gradient of sum())
     ComputeGraph g;
     auto* x = g.emplace<InputNode>("x", X);
     Node* out = build(g, x);
     Tensor seed(out_shape);
-    for (auto& v : seed.data) v = 1.0f;
+    for (auto& v : seed) v = 1.0f;
     auto* s = g.emplace<InputNode>("s", seed);
 
     autograd::BackwardBuilder bb(g);
@@ -334,15 +334,15 @@ static Tensor numerical_grad(Build build, const Tensor& X, float eps = 1e-3f) {
         g.accept(e);
         const auto& y = e.result(out);
         double s = 0;
-        for (int i = 0; i < y.numel(); ++i) s += y.data[i];
+        for (int i = 0; i < y.numel(); ++i) s += y[i];
         return s;
     };
 
-    Tensor grad(X.shape);
+    Tensor grad(X.shape());
     for (int i = 0; i < X.numel(); ++i) {
-        Tensor Xp = X; Xp.data[i] += eps;
-        Tensor Xm = X; Xm.data[i] -= eps;
-        grad.data[i] = (eval_loss(Xp) - eval_loss(Xm)) / (2.0 * eps);
+        Tensor Xp = X; Xp[i] += eps;
+        Tensor Xm = X; Xm[i] -= eps;
+        grad[i] = (eval_loss(Xp) - eval_loss(Xm)) / (2.0 * eps);
     }
     return grad;
 }
@@ -362,7 +362,7 @@ TEST(autograd_matmul_grad) {
 TEST(autograd_relu_grad) {
     // Avoid the kink at 0 — push values away so finite differences stay valid
     Tensor X = random_tensor({2, 3}, 9);
-    for (auto& v : X.data) v = (v >= 0 ? v + 0.2f : v - 0.2f);
+    for (auto& v : X) v = (v >= 0 ? v + 0.2f : v - 0.2f);
     auto build = [&](ComputeGraph& g, Node* x) {
         return g.emplace<MapNode>(x, MapOp::ReLU);
     };

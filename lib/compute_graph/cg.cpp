@@ -23,7 +23,7 @@ std::vector<int> Tensor::make_strides(const std::vector<int>& shape) {
     return strides;
 }
 
-int Tensor::numel() const {
+static int product_of_shape(const std::vector<int>& shape) {
     if (shape.empty()) return 0;
     for (int d : shape)
         if (d < 0) throw std::runtime_error("Tensor: negative dimension in shape");
@@ -31,20 +31,20 @@ int Tensor::numel() const {
 }
 
 Tensor::Tensor(std::vector<int> shape)
-    : shape(shape)
-    , strides(make_strides(shape))
-    , data(numel(), 0.0f)
+    : shape_(std::move(shape))
+    , strides_(make_strides(shape_))
+    , data_(product_of_shape(shape_), 0.0f)
 {}
 
-Tensor::Tensor(std::vector<int> shape_, std::vector<float> data_)
-    : shape(std::move(shape_))
-    , strides(make_strides(shape))
-    , data(std::move(data_))
+Tensor::Tensor(std::vector<int> shape, std::vector<float> data)
+    : shape_(std::move(shape))
+    , strides_(make_strides(shape_))
+    , data_(std::move(data))
 {
-    int n = numel();
-    if ((int)data.size() != n)
+    int n = product_of_shape(shape_);
+    if ((int)data_.size() != n)
         throw std::runtime_error(
-            "Tensor: data size " + std::to_string(data.size()) +
+            "Tensor: data size " + std::to_string(data_.size()) +
             " does not match shape numel " + std::to_string(n));
 }
 
@@ -68,11 +68,11 @@ static int compute_offset(const std::vector<int>& shape,
 }
 
 float& Tensor::at(const std::vector<int>& idx) {
-    return data[compute_offset(shape, strides, idx)];
+    return data_[compute_offset(shape_, strides_, idx)];
 }
 
 float Tensor::at(const std::vector<int>& idx) const {
-    return data[compute_offset(shape, strides, idx)];
+    return data_[compute_offset(shape_, strides_, idx)];
 }
 
 // --- ComputeGraph ---

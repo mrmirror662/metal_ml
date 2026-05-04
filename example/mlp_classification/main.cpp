@@ -28,10 +28,11 @@ using namespace cg;
 // ---- Model ---------------------------------------------------------------
 struct MLP {
     nn::Dense fc1, fc2;
-    MLP(std::mt19937& rng) : fc1(784, 128, rng), fc2(128, 10, rng) {}
+    MLP(ComputeGraph& g, std::mt19937& rng)
+        : fc1(g, 784, 128, rng), fc2(g, 128, 10, rng) {}
 
     Node* forward(ComputeGraph& g, Node* x, int batch) {
-        return fc2(g, nn::relu(g, fc1(g, x, batch)), batch);
+        return fc2(nn::relu(g, fc1(x, batch)), batch);
     }
 
     std::vector<Node*> params() const {
@@ -41,9 +42,9 @@ struct MLP {
     }
 
     template <typename BB>
-    void apply_sgd(ComputeGraph& g, BB& bb, float lr) {
-        fc1.apply_sgd(g, bb, lr);
-        fc2.apply_sgd(g, bb, lr);
+    void apply_sgd(BB& bb, float lr) {
+        fc1.apply_sgd(bb, lr);
+        fc2.apply_sgd(bb, lr);
     }
 
     template <typename Exec>
@@ -55,13 +56,13 @@ struct Trainer {
     static constexpr int batch = 64;
     static constexpr int n_cls = 10;
 
+    ComputeGraph g;                   // declared before mlp so its ref is valid
     MLP          mlp;
-    ComputeGraph g;
     InputNode   *X_in  = nullptr;
     InputNode   *OH_in = nullptr;
     Node        *y     = nullptr;     // softmax output — used by both train & eval
 
-    Trainer(std::mt19937& rng, float lr) : mlp(rng) {
+    Trainer(std::mt19937& rng, float lr) : mlp(g, rng) {
         X_in  = g.emplace<InputNode>("X",  Tensor({batch, 784}));
         OH_in = g.emplace<InputNode>("OH", Tensor({batch, n_cls}));
 
@@ -72,7 +73,7 @@ struct Trainer {
         autograd::BackwardBuilder bb(g);
         bb.seed(logits, dz);
         bb.build(mlp.params());
-        mlp.apply_sgd(g, bb, lr);
+        mlp.apply_sgd(bb, lr);
     }
 };
 
@@ -80,13 +81,13 @@ struct Trainer {
 static void fill_train_batch(Trainer& t, const mnist::Dataset& tr,
                              const std::vector<int>& idx, int b_off)
 {
-    std::fill(t.OH_in->tensor.data.begin(), t.OH_in->tensor.data.end(), 0.0f);
+    std::fill(t.OH_in->tensor.begin(), t.OH_in->tensor.end(), 0.0f);
     for (int i = 0; i < Trainer::batch; ++i) {
         int s = idx[b_off + i];
-        std::memcpy(t.X_in->tensor.data.data() + i * 784,
-                    tr.images.data.data()      + s * 784,
+        std::memcpy(t.X_in->tensor.data() + i * 784,
+                    tr.images.data()      + s * 784,
                     784 * sizeof(float));
-        t.OH_in->tensor.data[i * Trainer::n_cls + tr.labels[s]] = 1.0f;
+        t.OH_in->tensor[i * Trainer::n_cls + tr.labels[s]] = 1.0f;
     }
 }
 
@@ -94,7 +95,7 @@ static std::pair<float, int>
 loss_and_acc(const Tensor& y, const std::vector<int>& Y) {
     float loss = 0.0f; int correct = 0;
     for (int i = 0; i < Trainer::batch; ++i) {
-        const float* row = y.data.data() + i * Trainer::n_cls;
+        const float* row = y.data() + i * Trainer::n_cls;
         loss -= std::log(std::max(row[Y[i]], 1e-9f));
         int pred = 0;
         for (int j = 1; j < Trainer::n_cls; ++j) if (row[j] > row[pred]) pred = j;
@@ -109,14 +110,14 @@ static float evaluate(Trainer& t, const mnist::Dataset& te, Executor& exec) {
     int n = (int)te.labels.size();
     int correct = 0, total = 0;
     for (int b = 0; b + Trainer::batch <= n; b += Trainer::batch) {
-        std::memcpy(t.X_in->tensor.data.data(),
-                    te.images.data.data() + b * 784,
+        std::memcpy(t.X_in->tensor.data(),
+                    te.images.data() + b * 784,
                     Trainer::batch * 784 * sizeof(float));
         exec.reset();
         t.g.accept(exec, t.y);              // <-- subgraph: forward only
         const Tensor& yv = exec.result(t.y);
         for (int i = 0; i < Trainer::batch; ++i) {
-            const float* row = yv.data.data() + i * Trainer::n_cls;
+            const float* row = yv.data() + i * Trainer::n_cls;
             int pred = 0;
             for (int j = 1; j < Trainer::n_cls; ++j) if (row[j] > row[pred]) pred = j;
             if (pred == te.labels[b + i]) ++correct;

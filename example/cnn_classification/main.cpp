@@ -24,20 +24,20 @@ struct CNN {
     nn::Conv2D conv1;
     nn::Dense  fc;
 
-    CNN(std::mt19937& rng)
-        : conv1(/*in*/1, /*out*/8, /*kH*/3, /*kW*/3, /*stride*/2, /*pad*/1, rng)
-        , fc(1568, 10, rng) {}
+    CNN(ComputeGraph& g, std::mt19937& rng)
+        : conv1(g, /*in*/1, /*out*/8, /*kH*/3, /*kW*/3, /*stride*/2, /*pad*/1, rng)
+        , fc(g, 1568, 10, rng) {}
 
     Node* forward(ComputeGraph& g, Node* x_flat, int batch) {
         auto* x4d  = g.emplace<ReshapeNode>(x_flat,
                        std::vector<int>{batch, 784},
                        std::vector<int>{batch, 1, 28, 28});
-        auto* c    = conv1(g, x4d, std::vector<int>{batch, 1, 28, 28});
+        auto* c    = conv1(x4d, std::vector<int>{batch, 1, 28, 28});
         auto* a    = nn::relu(g, c);
         auto* flat = g.emplace<ReshapeNode>(a,
                        std::vector<int>{batch, 8, 14, 14},
                        std::vector<int>{batch, 1568});
-        return       fc(g, flat, batch);
+        return       fc(flat, batch);
     }
 
     std::vector<Node*> params() const {
@@ -47,9 +47,9 @@ struct CNN {
     }
 
     template <typename BB>
-    void apply_sgd(ComputeGraph& g, BB& bb, float lr) {
-        conv1.apply_sgd(g, bb, lr);
-        fc.apply_sgd(g, bb, lr);
+    void apply_sgd(BB& bb, float lr) {
+        conv1.apply_sgd(bb, lr);
+        fc.apply_sgd(bb, lr);
     }
 
     template <typename Exec>
@@ -61,13 +61,13 @@ struct Trainer {
     static constexpr int batch = 64;
     static constexpr int n_cls = 10;
 
+    ComputeGraph g;                   // declared before model so its ref is valid
     CNN          model;
-    ComputeGraph g;
     InputNode   *X_in  = nullptr;
     InputNode   *OH_in = nullptr;
     Node        *y     = nullptr;
 
-    Trainer(std::mt19937& rng, float lr) : model(rng) {
+    Trainer(std::mt19937& rng, float lr) : model(g, rng) {
         X_in  = g.emplace<InputNode>("X",  Tensor({batch, 784}));
         OH_in = g.emplace<InputNode>("OH", Tensor({batch, n_cls}));
 
@@ -78,20 +78,20 @@ struct Trainer {
         autograd::BackwardBuilder bb(g);
         bb.seed(logits, dz);
         bb.build(model.params());
-        model.apply_sgd(g, bb, lr);
+        model.apply_sgd(bb, lr);
     }
 };
 
 static void fill_train_batch(Trainer& t, const mnist::Dataset& tr,
                              const std::vector<int>& idx, int b_off)
 {
-    std::fill(t.OH_in->tensor.data.begin(), t.OH_in->tensor.data.end(), 0.0f);
+    std::fill(t.OH_in->tensor.begin(), t.OH_in->tensor.end(), 0.0f);
     for (int i = 0; i < Trainer::batch; ++i) {
         int s = idx[b_off + i];
-        std::memcpy(t.X_in->tensor.data.data() + i * 784,
-                    tr.images.data.data()      + s * 784,
+        std::memcpy(t.X_in->tensor.data() + i * 784,
+                    tr.images.data()      + s * 784,
                     784 * sizeof(float));
-        t.OH_in->tensor.data[i * Trainer::n_cls + tr.labels[s]] = 1.0f;
+        t.OH_in->tensor[i * Trainer::n_cls + tr.labels[s]] = 1.0f;
     }
 }
 
@@ -99,7 +99,7 @@ static std::pair<float, int>
 loss_and_acc(const Tensor& y, const std::vector<int>& Y) {
     float loss = 0.0f; int correct = 0;
     for (int i = 0; i < Trainer::batch; ++i) {
-        const float* row = y.data.data() + i * Trainer::n_cls;
+        const float* row = y.data() + i * Trainer::n_cls;
         loss -= std::log(std::max(row[Y[i]], 1e-9f));
         int pred = 0;
         for (int j = 1; j < Trainer::n_cls; ++j) if (row[j] > row[pred]) pred = j;
@@ -112,14 +112,14 @@ static float evaluate(Trainer& t, const mnist::Dataset& te, metal::Executor& exe
     int n = (int)te.labels.size();
     int correct = 0, total = 0;
     for (int b = 0; b + Trainer::batch <= n; b += Trainer::batch) {
-        std::memcpy(t.X_in->tensor.data.data(),
-                    te.images.data.data() + b * 784,
+        std::memcpy(t.X_in->tensor.data(),
+                    te.images.data() + b * 784,
                     Trainer::batch * 784 * sizeof(float));
         exec.reset();
         t.g.accept(exec, t.y);              // forward subgraph only
         const Tensor& yv = exec.result(t.y);
         for (int i = 0; i < Trainer::batch; ++i) {
-            const float* row = yv.data.data() + i * Trainer::n_cls;
+            const float* row = yv.data() + i * Trainer::n_cls;
             int pred = 0;
             for (int j = 1; j < Trainer::n_cls; ++j) if (row[j] > row[pred]) pred = j;
             if (pred == te.labels[b + i]) ++correct;

@@ -87,9 +87,9 @@ private:
 
     static std::string shape(const Tensor& t) {
         std::string s = "[";
-        for (int i = 0; i < (int)t.shape.size(); ++i) {
-            s += std::to_string(t.shape[i]);
-            if (i + 1 < (int)t.shape.size()) s += "x";
+        for (int i = 0; i < (int)t.shape().size(); ++i) {
+            s += std::to_string(t.shape()[i]);
+            if (i + 1 < (int)t.shape().size()) s += "x";
         }
         return s + "]";
     }

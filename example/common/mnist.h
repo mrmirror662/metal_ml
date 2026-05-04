@@ -44,7 +44,7 @@ inline Dataset load(const std::string& images_path, const std::string& labels_pa
     fl.read(reinterpret_cast<char*>(rl.data()), n);
 
     cg::Tensor images({(int)n, dim});
-    for (size_t i = 0; i < raw.size(); ++i) images.data[i] = raw[i] / 255.0f;
+    for (size_t i = 0; i < raw.size(); ++i) images[i] = raw[i] / 255.0f;
     std::vector<int> labels(n);
     for (uint32_t i = 0; i < n; ++i) labels[i] = rl[i];
     return {std::move(images), std::move(labels)};
@@ -64,7 +64,7 @@ inline Dataset load_test() {
 inline cg::Tensor one_hot(const std::vector<int>& labels, int n_classes) {
     cg::Tensor t({(int)labels.size(), n_classes});
     for (size_t i = 0; i < labels.size(); ++i)
-        t.data[i * n_classes + labels[i]] = 1.0f;
+        t[i * n_classes + labels[i]] = 1.0f;
     return t;
 }
 

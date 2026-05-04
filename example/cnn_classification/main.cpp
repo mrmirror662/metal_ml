@@ -1,13 +1,5 @@
-// CNN classifier on MNIST. Metal-only. Forward + autograd backward + SGD
-// update built as a single cg::ComputeGraph.
-//
-// Architecture:
-//   X [N, 1, 28, 28]
-//     -> Conv2D(1->8, 3x3, stride=2, pad=1)   -> [N, 8, 14, 14]
-//     -> ReLU
-//     -> Reshape flatten                      -> [N, 1568]
-//     -> Linear(1568 -> 10)
-//     -> Softmax
+// MNIST CNN. Conv2D + Dense layers own their own parameters; the training
+// loop is a single cg::ComputeGraph executed on Metal.
 
 #include "cg.h"
 #include "nn.h"
@@ -26,80 +18,74 @@
 
 using namespace cg;
 
-// --- Model parameters ----------------------------------------------------
+// ---- Model ---------------------------------------------------------------
 struct CNN {
-    Tensor K1;   // [8, 1, 3, 3]   conv kernel
-    Tensor W;    // [1568, 10]     linear weight
-    Tensor b;    // [1, 10]        bias
+    nn::Conv2D conv1;   // 1 -> 8, 3x3, stride=2, pad=1   ->  [N, 8, 14, 14]
+    nn::Dense  fc;      // 1568 -> 10
+
+    CNN(std::mt19937& rng)
+        : conv1(/*in*/1, /*out*/8, /*kH*/3, /*kW*/3, /*stride*/2, /*pad*/1, rng)
+        , fc(1568, 10, rng) {}
+
+    // Returns logits (pre-softmax)
+    Node* forward(ComputeGraph& g, Node* x_flat, int batch) {
+        auto* x4d  = g.emplace<ReshapeNode>(x_flat,
+                       std::vector<int>{batch, 784},
+                       std::vector<int>{batch, 1, 28, 28});
+        auto* c    = conv1(g, x4d, std::vector<int>{batch, 1, 28, 28});
+        auto* a    = nn::relu(g, c);
+        auto* flat = g.emplace<ReshapeNode>(a,
+                       std::vector<int>{batch, 8, 14, 14},
+                       std::vector<int>{batch, 1568});
+        return       fc(g, flat, batch);
+    }
+
+    std::vector<Node*> params() const {
+        auto p = conv1.params();
+        for (auto* n : fc.params()) p.push_back(n);
+        return p;
+    }
+
+    template <typename BB>
+    void apply_sgd(ComputeGraph& g, BB& bb, float lr) {
+        conv1.apply_sgd(g, bb, lr);
+        fc.apply_sgd(g, bb, lr);
+    }
+
+    template <typename Exec>
+    void refresh(Exec& exec) { conv1.refresh(exec); fc.refresh(exec); }
 };
 
-static CNN init_cnn(std::mt19937& rng) {
-    auto he = [&](std::vector<int> shape, int fan_in) {
-        std::normal_distribution<float> d(0.0f, std::sqrt(2.0f / fan_in));
-        Tensor t(shape);
-        for (auto& v : t.data) v = d(rng);
-        return t;
-    };
-    return {
-        he({8, 1, 3, 3}, 1 * 3 * 3),    // fan_in for conv = C_in * kH * kW
-        he({1568, 10},   1568),
-        Tensor({1, 10}),
-    };
-}
-
-// --- Train one batch ------------------------------------------------------
+// ---- Training step ------------------------------------------------------
 static std::pair<float, int>
 train_step(CNN& m, const Tensor& X, const std::vector<int>& Y, float lr,
            metal::Executor& exec, bool print_graph)
 {
-    int batch  = X.shape[0];
-    int n_cls  = m.W.shape[1];
+    int batch = X.shape[0];
+    int n_cls = 10;
 
     ComputeGraph g;
-    auto* x_flat = g.emplace<InputNode>("X",  X);                        // [N, 784]
-    auto* K1     = g.emplace<InputNode>("K1", m.K1);
-    auto* W      = g.emplace<InputNode>("W",  m.W);
-    auto* b      = g.emplace<InputNode>("b",  m.b);
+    auto* x      = g.emplace<InputNode>("X",  X);
     auto* oh     = g.emplace<InputNode>("OH", mnist::one_hot(Y, n_cls));
 
-    // --- Forward ---
-    auto* x      = g.emplace<ReshapeNode>(x_flat,
-                       std::vector<int>{batch, 784},
-                       std::vector<int>{batch, 1, 28, 28});
-    auto* c1     = nn::conv2d(g, x, K1,
-                       std::vector<int>{batch, 1, 28, 28},
-                       std::vector<int>{8, 1, 3, 3},
-                       /*stride=*/2, /*pad=*/1);                          // [N, 8, 14, 14]
-    auto* a1     = nn::relu(g, c1);
-    auto* flat   = g.emplace<ReshapeNode>(a1,
-                       std::vector<int>{batch, 8, 14, 14},
-                       std::vector<int>{batch, 1568});
-    auto* z      = g.emplace<MatMulNode>(flat, W);                        // [N, 10]
-    auto* b_brd  = g.emplace<BroadcastNode>(b, 0, batch);
-    auto* z2     = g.emplace<MatAddNode>(z, b_brd);
-    auto* y      = nn::softmax(g, z2);
+    auto* logits = m.forward(g, x, batch);
+    auto* y      = nn::softmax(g, logits);
 
-    // --- Autograd backward (seeded with softmax+CE shortcut) ---
-    auto* dz2 = nn::softmax_ce_backward(g, y, oh, batch);
+    auto* dz = nn::softmax_ce_backward(g, y, oh, batch);
     autograd::BackwardBuilder bb(g);
-    bb.seed(z2, dz2);
-    bb.build({K1, W, b});
+    bb.seed(logits, dz);
+    bb.build(m.params());
 
-    // --- SGD update ---
-    auto* K1_new = nn::sgd_step(g, K1, bb.grad(K1), lr);
-    auto* W_new  = nn::sgd_step(g, W,  bb.grad(W),  lr);
-    auto* b_new  = nn::sgd_step(g, b,  bb.grad(b),  lr);
+    m.apply_sgd(g, bb, lr);
 
     if (print_graph) {
         std::cout << "--- TRAIN GRAPH ---\n";
         PrintVisitor p; g.accept(p); std::cout << "\n";
     }
 
-    exec.clear();
-    g.accept(exec);
+    exec.clear(); g.accept(exec);
 
-    // Loss + accuracy
-    Tensor y_v = exec.result(y);
+    const Tensor& y_v = exec.result(y);
     float loss = 0.0f; int correct = 0;
     for (int i = 0; i < batch; ++i) {
         const float* row = y_v.data.data() + i * n_cls;
@@ -110,45 +96,25 @@ train_step(CNN& m, const Tensor& X, const std::vector<int>& Y, float lr,
     }
     loss /= batch;
 
-    m.K1 = exec.result(K1_new);
-    m.W  = exec.result(W_new);
-    m.b  = exec.result(b_new);
+    m.refresh(exec);
     return {loss, correct};
 }
 
-// --- Evaluate (forward only) ---------------------------------------------
-static float evaluate(const CNN& m, const Tensor& X, const std::vector<int>& Y,
-                      metal::Executor& exec)
-{
+static float evaluate(CNN& m, const Tensor& X, const std::vector<int>& Y, metal::Executor& exec) {
     int batch = X.shape[0];
-    int n_cls = m.W.shape[1];
+    int n_cls = 10;
 
     ComputeGraph g;
-    auto* x_flat = g.emplace<InputNode>("X",  X);
-    auto* K1     = g.emplace<InputNode>("K1", m.K1);
-    auto* W      = g.emplace<InputNode>("W",  m.W);
-    auto* b      = g.emplace<InputNode>("b",  m.b);
-
-    auto* x   = g.emplace<ReshapeNode>(x_flat,
-                   std::vector<int>{batch, 784},
-                   std::vector<int>{batch, 1, 28, 28});
-    auto* c1  = nn::conv2d(g, x, K1,
-                   std::vector<int>{batch, 1, 28, 28},
-                   std::vector<int>{8, 1, 3, 3}, 2, 1);
-    auto* a1  = nn::relu(g, c1);
-    auto* fl  = g.emplace<ReshapeNode>(a1,
-                   std::vector<int>{batch, 8, 14, 14},
-                   std::vector<int>{batch, 1568});
-    auto* z   = g.emplace<MatMulNode>(fl, W);
-    auto* zb  = g.emplace<MatAddNode>(z, g.emplace<BroadcastNode>(b, 0, batch));
-    auto* y   = nn::softmax(g, zb);
+    auto* x      = g.emplace<InputNode>("X", X);
+    auto* logits = m.forward(g, x, batch);
+    auto* y      = nn::softmax(g, logits);
 
     exec.clear(); g.accept(exec);
-    Tensor y_v = exec.result(y);
+    const Tensor& yv = exec.result(y);
 
     int correct = 0;
     for (int i = 0; i < batch; ++i) {
-        const float* row = y_v.data.data() + i * n_cls;
+        const float* row = yv.data.data() + i * n_cls;
         int pred = 0;
         for (int j = 1; j < n_cls; ++j) if (row[j] > row[pred]) pred = j;
         if (pred == Y[i]) ++correct;
@@ -156,7 +122,7 @@ static float evaluate(const CNN& m, const Tensor& X, const std::vector<int>& Y,
     return (float)correct / batch;
 }
 
-// --- Train loop ----------------------------------------------------------
+// ---- Main ---------------------------------------------------------------
 int main() {
     std::cout << "Loading MNIST...\n";
     auto tr = mnist::load_train();
@@ -168,7 +134,7 @@ int main() {
     constexpr float lr         = 0.1f;
 
     std::mt19937 rng(42);
-    CNN model = init_cnn(rng);
+    CNN model(rng);
     metal::Executor exec;
     std::cout << "[Metal] device: " << exec.device_name() << "\n\n";
 

@@ -1,5 +1,5 @@
-// MNIST MLP. Forward + backward + SGD update — all in ONE cg::ComputeGraph.
-// Run on CPU and Metal back-to-back.
+// MNIST MLP. Forward + backward + SGD update — all in one cg::ComputeGraph.
+// Layers (nn::Dense) own their parameters; no manual W/b declarations.
 
 #include "cg.h"
 #include "nn.h"
@@ -17,58 +17,58 @@
 #include <random>
 #include <vector>
 
-// MNIST loader and one_hot live in common/mnist.h
+using namespace cg;
 
-// ---- Model parameters ----------------------------------------------------
-struct MLP { cg::Tensor W1, b1, W2, b2; };
+// ---- Model ---------------------------------------------------------------
+struct MLP {
+    nn::Dense fc1, fc2;
+    MLP(std::mt19937& rng) : fc1(784, 128, rng), fc2(128, 10, rng) {}
 
-static MLP init_mlp(int in_dim, int hidden, int out_dim, std::mt19937& rng) {
-    auto he = [&](std::vector<int> shape, int fan_in) {
-        std::normal_distribution<float> d(0.0f, std::sqrt(2.0f / fan_in));
-        cg::Tensor t(shape);
-        for (auto& v : t.data) v = d(rng);
-        return t;
-    };
-    return { he({in_dim, hidden},  in_dim),  cg::Tensor({1, hidden}),
-             he({hidden, out_dim}, hidden),  cg::Tensor({1, out_dim}) };
-}
+    // Returns logits (pre-softmax)
+    Node* forward(ComputeGraph& g, Node* x, int batch) {
+        auto* z1 = fc1(g, x, batch);
+        auto* a1 = nn::relu(g, z1);
+        return     fc2(g, a1, batch);
+    }
 
-// ---- One training step: forward + backward + SGD, single graph ----------
+    std::vector<Node*> params() const {
+        auto p = fc1.params();
+        for (auto* n : fc2.params()) p.push_back(n);
+        return p;
+    }
+
+    template <typename BB>
+    void apply_sgd(ComputeGraph& g, BB& bb, float lr) {
+        fc1.apply_sgd(g, bb, lr);
+        fc2.apply_sgd(g, bb, lr);
+    }
+
+    template <typename Exec>
+    void refresh(Exec& exec) { fc1.refresh(exec); fc2.refresh(exec); }
+};
+
+// ---- Train one batch ----------------------------------------------------
 template <typename Executor>
 static std::pair<float, int>
-train_step(MLP& mlp, const cg::Tensor& X, const std::vector<int>& Y, float lr,
+train_step(MLP& mlp, const Tensor& X, const std::vector<int>& Y, float lr,
            Executor& exec, bool print_graph)
 {
-    using namespace cg;
     int batch = X.shape[0];
-    int n_cls = mlp.W2.shape[1];
+    int n_cls = 10;
 
     ComputeGraph g;
     auto* x  = g.emplace<InputNode>("X",  X);
-    auto* W1 = g.emplace<InputNode>("W1", mlp.W1);
-    auto* b1 = g.emplace<InputNode>("b1", mlp.b1);
-    auto* W2 = g.emplace<InputNode>("W2", mlp.W2);
-    auto* b2 = g.emplace<InputNode>("b2", mlp.b2);
     auto* oh = g.emplace<InputNode>("OH", mnist::one_hot(Y, n_cls));
 
-    // --- forward ---
-    auto* z1 = nn::linear(g, x, W1, b1, batch);
-    auto* a1 = nn::relu(g, z1);
-    auto* z2 = nn::linear(g, a1, W2, b2, batch);
-    auto* y  = nn::softmax(g, z2);
+    auto* logits = mlp.forward(g, x, batch);
+    auto* y      = nn::softmax(g, logits);
 
-    // --- autograd: seed the gradient at z2 (logits) with the softmax+CE
-    //     shortcut, then let BackwardBuilder emit the rest.
-    auto* dz2 = nn::softmax_ce_backward(g, y, oh, batch);
+    auto* dz = nn::softmax_ce_backward(g, y, oh, batch);
     autograd::BackwardBuilder bb(g);
-    bb.seed(z2, dz2);
-    bb.build({W1, b1, W2, b2});  // only emit grads on paths leading to params
+    bb.seed(logits, dz);
+    bb.build(mlp.params());
 
-    // --- SGD update — gradients pulled from autograd ---
-    auto* W1_new = nn::sgd_step(g, W1, bb.grad(W1), lr);
-    auto* W2_new = nn::sgd_step(g, W2, bb.grad(W2), lr);
-    auto* b1_new = nn::sgd_step(g, b1, bb.grad(b1), lr);
-    auto* b2_new = nn::sgd_step(g, b2, bb.grad(b2), lr);
+    mlp.apply_sgd(g, bb, lr);
 
     if (print_graph) {
         std::cout << "--- TRAIN GRAPH ---\n";
@@ -78,8 +78,7 @@ train_step(MLP& mlp, const cg::Tensor& X, const std::vector<int>& Y, float lr,
     exec.clear();
     g.accept(exec);
 
-    // Loss + accuracy from softmax output
-    const cg::Tensor& y_v = exec.result(y);
+    const Tensor& y_v = exec.result(y);
     float loss = 0.0f; int correct = 0;
     for (int i = 0; i < batch; ++i) {
         const float* row = y_v.data.data() + i * n_cls;
@@ -90,36 +89,22 @@ train_step(MLP& mlp, const cg::Tensor& X, const std::vector<int>& Y, float lr,
     }
     loss /= batch;
 
-    mlp.W1 = exec.result(W1_new);
-    mlp.W2 = exec.result(W2_new);
-    mlp.b1 = exec.result(b1_new);
-    mlp.b2 = exec.result(b2_new);
+    mlp.refresh(exec);
     return {loss, correct};
 }
 
-// ---- Eval (forward only) -------------------------------------------------
 template <typename Executor>
-static float evaluate(const MLP& mlp, const cg::Tensor& X,
-                      const std::vector<int>& Y, Executor& exec)
-{
-    using namespace cg;
+static float evaluate(MLP& mlp, const Tensor& X, const std::vector<int>& Y, Executor& exec) {
     int batch = X.shape[0];
-    int n_cls = mlp.W2.shape[1];
+    int n_cls = 10;
 
     ComputeGraph g;
-    auto* x  = g.emplace<InputNode>("X",  X);
-    auto* W1 = g.emplace<InputNode>("W1", mlp.W1);
-    auto* b1 = g.emplace<InputNode>("b1", mlp.b1);
-    auto* W2 = g.emplace<InputNode>("W2", mlp.W2);
-    auto* b2 = g.emplace<InputNode>("b2", mlp.b2);
-
-    auto* y = nn::softmax(g,
-                nn::linear(g,
-                  nn::relu(g, nn::linear(g, x, W1, b1, batch)),
-                  W2, b2, batch));
+    auto* x      = g.emplace<InputNode>("X", X);
+    auto* logits = mlp.forward(g, x, batch);
+    auto* y      = nn::softmax(g, logits);
 
     exec.clear(); g.accept(exec);
-    const auto& yv = exec.result(y);
+    const Tensor& yv = exec.result(y);
 
     int correct = 0;
     for (int i = 0; i < batch; ++i) {
@@ -131,17 +116,16 @@ static float evaluate(const MLP& mlp, const cg::Tensor& X,
     return (float)correct / batch;
 }
 
-// ---- Train loop ----------------------------------------------------------
 template <typename Executor>
 static void train(const char* label, const mnist::Dataset& tr, const mnist::Dataset& te,
                   Executor& exec)
 {
-    constexpr int batch_size = 64, n_epochs = 5;
-    constexpr float lr = 0.1f;
+    constexpr int   batch_size = 64, n_epochs = 5;
+    constexpr float lr         = 0.1f;
     std::cout << "\n===== Training on " << label << " =====\n";
 
     std::mt19937 rng(42);
-    MLP mlp = init_mlp(784, 128, 10, rng);
+    MLP mlp(rng);
 
     int n = (int)tr.labels.size();
     std::vector<int> idx(n);
@@ -154,7 +138,7 @@ static void train(const char* label, const mnist::Dataset& tr, const mnist::Data
         auto t0 = std::chrono::high_resolution_clock::now();
 
         for (int b = 0; b + batch_size <= n; b += batch_size) {
-            cg::Tensor X({batch_size, 784});
+            Tensor X({batch_size, 784});
             std::vector<int> Y(batch_size);
             for (int i = 0; i < batch_size; ++i) {
                 int s = idx[b + i];

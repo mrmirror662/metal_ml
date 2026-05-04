@@ -133,6 +133,10 @@ public:
 
     std::vector<Node*> params() const { return {W_n_, b_n_}; }
 
+    // Emit SGD update sub-graphs and AssignNodes that write the new values
+    // back into W_n_/b_n_ in the same accept() pass. No post-run refresh
+    // needed — the next pass's visit(InputNode) re-uploads the updated host
+    // tensor.
     template <typename BB>
     void apply_sgd(BB& bb, float lr) {
         if (!W_n_ || !b_n_)
@@ -141,23 +145,14 @@ public:
         Node* gb = bb.grad(b_n_);
         if (!gW || !gb)
             throw std::runtime_error("Dense::apply_sgd: missing gradient — did you seed autograd and call build({params...})?");
-        W_u_ = sgd_step(*g_, W_n_, gW, lr);
-        b_u_ = sgd_step(*g_, b_n_, gb, lr);
-    }
-
-    template <typename Exec>
-    void refresh(Exec& exec) {
-        W_ = exec.result(W_u_);
-        b_ = exec.result(b_u_);
-        W_n_->tensor = W_;
-        b_n_->tensor = b_;
+        g_->emplace<AssignNode>(W_n_, sgd_step(*g_, W_n_, gW, lr));
+        g_->emplace<AssignNode>(b_n_, sgd_step(*g_, b_n_, gb, lr));
     }
 
 private:
     ComputeGraph* g_;
     Tensor        W_, b_;
     InputNode    *W_n_ = nullptr, *b_n_ = nullptr;
-    Node         *W_u_ = nullptr, *b_u_ = nullptr;
 };
 
 class Conv2D {
@@ -185,13 +180,7 @@ public:
         Node* gK = bb.grad(K_n_);
         if (!gK)
             throw std::runtime_error("Conv2D::apply_sgd: missing kernel gradient — did you seed autograd and call build({K})?");
-        K_u_ = sgd_step(*g_, K_n_, gK, lr);
-    }
-
-    template <typename Exec>
-    void refresh(Exec& exec) {
-        K_ = exec.result(K_u_);
-        K_n_->tensor = K_;
+        g_->emplace<AssignNode>(K_n_, sgd_step(*g_, K_n_, gK, lr));
     }
 
 private:
@@ -199,7 +188,6 @@ private:
     Tensor        K_;
     int           stride_, pad_;
     InputNode    *K_n_ = nullptr;
-    Node         *K_u_ = nullptr;
 };
 
 } // namespace cg::nn

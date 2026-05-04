@@ -399,6 +399,30 @@ TEST(autograd_conv2d_grad) {
 }
 
 // =============================================================================
+// AssignNode: target's value persists across runs (CPU + Metal)
+// =============================================================================
+
+template <typename Executor>
+static void check_assign_persists() {
+    ComputeGraph g;
+    auto* W = g.emplace<InputNode>("W", mk({2, 2}, {1, 2, 3, 4}));
+    auto* delta = g.emplace<InputNode>("d", mk({2, 2}, {10, 10, 10, 10}));
+    auto* sum = g.emplace<MatAddNode>(W, delta);
+    g.emplace<AssignNode>(W, sum);
+
+    Executor exec;
+    g.accept(exec);                       // first pass: W ← W + delta = {11,12,13,14}
+    EXPECT_NEAR(exec.result(W).at({0,0}), 11.0, 1e-5);
+    EXPECT_NEAR(W->tensor.at({1,1}),       14.0, 1e-5);   // host synced
+
+    exec.reset();
+    g.accept(exec);                       // second pass: W ← {11..14} + delta = {21..24}
+    EXPECT_NEAR(exec.result(W).at({0,0}), 21.0, 1e-5);
+    EXPECT_NEAR(exec.result(W).at({1,1}), 24.0, 1e-5);
+}
+
+TEST(assign_persists_cpu)   { check_assign_persists<cpu::Executor>(); }
+TEST(assign_persists_metal) { check_assign_persists<metal::Executor>(); }
 
 int main() {
     return test::run_all();

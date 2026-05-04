@@ -27,6 +27,7 @@ public:
     void visit(cg::ReshapeNode&   node) override;
     void visit(cg::Im2ColNode&    node) override;
     void visit(cg::Col2ImNode&    node) override;
+    void visit(cg::AssignNode&    node) override;
 
     const std::string  device_name() const;
     const cg::Tensor&  result(cg::Node* node) const;  // implicitly flushes

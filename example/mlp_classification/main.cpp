@@ -47,8 +47,6 @@ struct MLP {
         fc2.apply_sgd(bb, lr);
     }
 
-    template <typename Exec>
-    void refresh(Exec& exec) { fc1.refresh(exec); fc2.refresh(exec); }
 };
 
 // ---- Trainer: ONE graph for everything ----------------------------------
@@ -158,8 +156,6 @@ static void train(const char* label, const mnist::Dataset& tr, const mnist::Data
             for (int i = 0; i < Trainer::batch; ++i) Y[i] = tr.labels[idx[b + i]];
             auto [l, c] = loss_and_acc(exec.result(trainer.y), Y);
             loss += l; correct += c; ++batches;
-
-            trainer.mlp.refresh(exec);
         }
         double secs = std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now() - t0).count();

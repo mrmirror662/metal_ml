@@ -317,6 +317,18 @@ void Executor::visit(cg::Col2ImNode& node) {
     results_[&node] = std::move(out);
 }
 
+// Copy `value`'s tensor into `target` InputNode's host tensor. The next
+// accept() pass will re-upload the updated value to the executor's cache,
+// so SGD updates persist without a manual refresh().
+void Executor::visit(cg::AssignNode& node) {
+    const Tensor& v = results_.at(node.value);
+    if (v.shape() != node.target->tensor.shape())
+        throw std::runtime_error("Assign: shape mismatch with target '" + node.target->name + "'");
+    node.target->tensor   = v;     // host-side write-back (next pass uploads this)
+    results_[node.target] = v;     // exec.result(target) sees the new value
+    results_[&node]       = v;     // assign node's "result" is the assigned value
+}
+
 const cg::Tensor& Executor::result(cg::Node* node) const {
     return results_.at(node);
 }

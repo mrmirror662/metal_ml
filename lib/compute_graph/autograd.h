@@ -161,6 +161,8 @@ public:
             g_.emplace<Im2ColNode>(dy, n.output_shape, n.kH, n.kW, n.stride, n.pad));
     }
 
+    void visit(AssignNode&) override { /* not differentiable; SGD sinks */ }
+
     void visit(ReduceNode&) override {
         // Reduce backward needs the original input axis size; not yet supported.
         // (Reduce typically appears only in backward subgraphs, which we don't

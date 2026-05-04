@@ -541,6 +541,35 @@ void Executor::visit(cg::Col2ImNode& node) {
     }, grid, threadgroup);
 }
 
+// Copy `value`'s device buffer into `target` InputNode's host tensor (and
+// into target's device buffer, so any later read in the same pass sees the
+// new value). Runs after the GPU has finished producing the value buffer.
+//
+// Note: this still pays one device→host round trip per parameter per step.
+// A future optimization would alias the buffer (shared_ptr swap) and
+// suppress the host→device upload on the next visit(InputNode), avoiding
+// the round trip entirely.
+void Executor::visit(cg::AssignNode& node) {
+    const MetalBuffer& src = ctx_->device_results.at(node.value);
+    MetalBuffer&       dst = ctx_->device_results.at(node.target);
+    if (dst.shape != src.shape)
+        throw std::runtime_error("Metal Assign: shape mismatch with target '" + node.target->name + "'");
+
+    ctx_->flush();   // value buffer must be done writing before we read
+
+    size_t bytes = src.numel() * sizeof(float);
+    if ((int)node.target->tensor.numel() != src.numel())
+        throw std::runtime_error("Metal Assign: target tensor size mismatch");
+    std::memcpy(node.target->tensor.data(), src.buf->contents(), bytes);  // host sync
+    std::memcpy(dst.buf->contents(),        src.buf->contents(), bytes);  // device coherence
+
+    // Assign's result is the new value — alias the source buffer.
+    auto& mb = ctx_->device_results[&node];
+    mb.shape = src.shape;
+    mb.buf   = src.buf;
+    ctx_->host_cache.erase(&node);
+}
+
 const cg::Tensor& Executor::result(cg::Node* node) const {
     auto it = ctx_->host_cache.find(node);
     if (it != ctx_->host_cache.end()) return it->second;

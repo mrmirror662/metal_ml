@@ -69,6 +69,10 @@ public:
               + " (" + ref(node.input) + ")", node);
     }
 
+    void visit(AssignNode& node) override {
+        print("Assign  -> \"" + node.target->name + "\" (" + ref(node.value) + ")", node);
+    }
+
 private:
     std::ostream& out_;
     std::unordered_map<Node*, int> idx_;

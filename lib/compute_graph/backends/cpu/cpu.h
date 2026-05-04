@@ -18,6 +18,7 @@ public:
     void visit(cg::ReshapeNode&   node) override;
     void visit(cg::Im2ColNode&    node) override;
     void visit(cg::Col2ImNode&    node) override;
+    void visit(cg::AssignNode&    node) override;
 
     // Retrieve the output tensor computed for a node
     const cg::Tensor& result(cg::Node* node) const;

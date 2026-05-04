@@ -73,6 +73,7 @@ class BroadcastNode;
 class ReshapeNode;
 class Im2ColNode;
 class Col2ImNode;
+class AssignNode;
 
 // --- Visitor interface ---
 class Visitor {
@@ -90,6 +91,7 @@ public:
     virtual void visit(ReshapeNode&   node) = 0;
     virtual void visit(Im2ColNode&    node) = 0;
     virtual void visit(Col2ImNode&    node) = 0;
+    virtual void visit(AssignNode&    node) = 0;
 };
 
 // --- Abstract Node ---
@@ -262,6 +264,26 @@ public:
     Node*            input;
     std::vector<int> output_shape;   // [N, C, H, W]
     int              kH, kW, stride, pad;
+};
+
+// In-place assignment: copies `value` into `target`'s tensor (host) and into
+// the executor's device buffer for `target`. Used by SGD to write updated
+// parameters back into the layer's InputNode in one accept() pass — no
+// post-run refresh() needed. The next run's visit(InputNode) re-uploads the
+// updated value from the host tensor.
+//
+// Both `target` and `value` are listed as inputs so topo order visits them
+// before this node (target's buffer must exist; value must be computed).
+class AssignNode : public Node {
+public:
+    AssignNode(InputNode* target, NodeRef value) : target(target), value(value) {
+        if (!target) throw std::runtime_error("AssignNode: target is null");
+    }
+    void accept(Visitor& v) override { v.visit(*this); }
+    std::vector<Node*> inputs() const override { return {target, value}; }
+
+    InputNode* target;
+    Node*      value;
 };
 
 // --- ComputeGraph ---

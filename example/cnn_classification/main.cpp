@@ -52,8 +52,6 @@ struct CNN {
         fc.apply_sgd(bb, lr);
     }
 
-    template <typename Exec>
-    void refresh(Exec& exec) { conv1.refresh(exec); fc.refresh(exec); }
 };
 
 // ---- Trainer: one persistent graph --------------------------------------
@@ -162,8 +160,6 @@ int main() {
             for (int i = 0; i < Trainer::batch; ++i) Y[i] = tr.labels[idx[b + i]];
             auto [l, c] = loss_and_acc(exec.result(trainer.y), Y);
             loss += l; correct += c; ++batches;
-
-            trainer.model.refresh(exec);
         }
         double secs = std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now() - t0).count();

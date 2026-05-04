@@ -101,23 +101,24 @@ inline Node* sgd_step(ComputeGraph& g, Node* p, Node* grad, float lr) {
 
 // ===== Layers =============================================================
 //
-// A Layer owns its parameter Tensors. Each call to operator()(g, x, ...) adds
-// fresh InputNode entries to `g` for the parameters and returns the layer's
-// output node. After backward + SGD update graphs are built, call
-// refresh(exec) once the graph has been executed to read updated values.
+// A Layer owns its parameter Tensors and is bound to ONE ComputeGraph at
+// construction. operator()(x, batch) registers the parameter InputNodes in
+// that graph and returns the layer's output node. apply_sgd emits an SGD
+// update subgraph terminated by AssignNodes that write the new values back
+// into the parameter InputNodes in the same accept() pass — no post-run
+// refresh step needed.
 //
 // Typical training step:
-//   layer(g, x, batch);                  // forward; records param nodes
+//   layer(x, batch);                     // forward; records param nodes
 //   bb.build(layer.params());            // autograd
-//   layer.apply_sgd(g, bb, lr);          // emits update subgraph
-//   exec.accept(g);                       // run
-//   layer.refresh(exec);                 // tensor <- exec.result(update_node)
+//   layer.apply_sgd(bb, lr);             // emits update subgraph + assigns
+//   exec.accept(g);                      // run; params are now updated
 
 class Dense {
 public:
     // Layer is bound to ONE graph for its lifetime. The graph must outlive
     // the layer; storing the reference makes the contract explicit (and
-    // means apply_sgd / refresh can't be called against a different graph).
+    // means apply_sgd can't be called against a different graph).
     Dense(ComputeGraph& g, int in_dim, int out_dim, std::mt19937& rng)
         : g_(&g), W_({in_dim, out_dim}), b_({1, out_dim})
     {

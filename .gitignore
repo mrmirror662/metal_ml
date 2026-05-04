@@ -6,6 +6,11 @@ cmake-build-*/
 # Auto-downloaded third-party
 third_party/
 
+# Python (uv / venv)
+__pycache__/
+.venv/
+*.pyc
+
 # Editor / OS
 .DS_Store
 .vscode/

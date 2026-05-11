@@ -1,5 +1,8 @@
 #include <metal_stdlib>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
+using namespace mpp::tensor_ops;
 
 // ============================================================================
 // Element-wise kernels
@@ -32,6 +35,15 @@ kernel void relu(
     uint index [[thread_position_in_grid]])
 {
     if (index < numel) out[index] = max(0.0f, in[index]);
+}
+
+kernel void sigmoid_op(
+    device const float* in    [[buffer(0)]],
+    device       float* out   [[buffer(1)]],
+    constant     uint&  numel [[buffer(2)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index < numel) out[index] = 1.0f / (1.0f + exp(-in[index]));
 }
 
 // Indicator: 1 if x > 0 else 0
@@ -291,6 +303,129 @@ kernel void reduce_axis(
 }
 
 // ============================================================================
+// MaxPool2D: [N,C,H,W] -> [N,C,Hout,Wout]. One thread per output element.
+// ============================================================================
+kernel void maxpool2d(
+    device const float* X    [[buffer(0)]],
+    device       float* Y    [[buffer(1)]],
+    constant     uint&  N    [[buffer(2)]],
+    constant     uint&  C    [[buffer(3)]],
+    constant     uint&  H    [[buffer(4)]],
+    constant     uint&  W    [[buffer(5)]],
+    constant     uint&  k    [[buffer(6)]],
+    constant     uint&  stride[[buffer(7)]],
+    constant     int&   pad  [[buffer(8)]],
+    constant     uint&  Hout [[buffer(9)]],
+    constant     uint&  Wout [[buffer(10)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = N * C * Hout * Wout;
+    if (gid >= total) return;
+
+    uint ow = gid % Wout;
+    uint oh = (gid / Wout) % Hout;
+    uint c  = (gid / (Wout * Hout)) % C;
+    uint n  = gid / (Wout * Hout * C);
+
+    float mx = -INFINITY;
+    for (uint ky = 0; ky < k; ++ky)
+        for (uint kx = 0; kx < k; ++kx) {
+            int ih = (int)(oh * stride + ky) - pad;
+            int iw = (int)(ow * stride + kx) - pad;
+            if (ih < 0 || ih >= (int)H || iw < 0 || iw >= (int)W) continue;
+            float v = X[((n * C + c) * H + (uint)ih) * W + (uint)iw];
+            if (v > mx) mx = v;
+        }
+    Y[gid] = mx;
+}
+
+// ============================================================================
+// UpsampleNearest: [N,C,H,W] -> [N,C,H*s,W*s]. One thread per output element.
+// ============================================================================
+kernel void upsample_nearest(
+    device const float* X     [[buffer(0)]],
+    device       float* Y     [[buffer(1)]],
+    constant     uint&  N     [[buffer(2)]],
+    constant     uint&  C     [[buffer(3)]],
+    constant     uint&  H     [[buffer(4)]],
+    constant     uint&  W     [[buffer(5)]],
+    constant     uint&  scale [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint Ho = H * scale;
+    uint Wo = W * scale;
+    uint total = N * C * Ho * Wo;
+    if (gid >= total) return;
+
+    uint ow = gid % Wo;
+    uint oh = (gid / Wo) % Ho;
+    uint c  = (gid / (Wo * Ho)) % C;
+    uint n  = gid / (Wo * Ho * C);
+
+    uint ih = oh / scale;
+    uint iw = ow / scale;
+    Y[gid] = X[((n * C + c) * H + ih) * W + iw];
+}
+
+// ============================================================================
+// Concat along channel axis: [N,Ca,H,W] + [N,Cb,H,W] -> [N,Ca+Cb,H,W].
+// One thread per output element; pick source by channel index.
+// ============================================================================
+kernel void concat_channel(
+    device const float* A     [[buffer(0)]],
+    device const float* B     [[buffer(1)]],
+    device       float* Y     [[buffer(2)]],
+    constant     uint&  N     [[buffer(3)]],
+    constant     uint&  Ca    [[buffer(4)]],
+    constant     uint&  Cb    [[buffer(5)]],
+    constant     uint&  H     [[buffer(6)]],
+    constant     uint&  W     [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint Cout = Ca + Cb;
+    uint total = N * Cout * H * W;
+    if (gid >= total) return;
+
+    uint w = gid % W;
+    uint h = (gid / W) % H;
+    uint c = (gid / (W * H)) % Cout;
+    uint n = gid / (W * H * Cout);
+
+    if (c < Ca) {
+        Y[gid] = A[((n * Ca + c) * H + h) * W + w];
+    } else {
+        uint cb = c - Ca;
+        Y[gid] = B[((n * Cb + cb) * H + h) * W + w];
+    }
+}
+
+// ============================================================================
+// BatchNorm2D inference: y[n,c,h,w] = gamma[c] * (x - mean[c]) / sqrt(var[c] + eps) + beta[c]
+// One thread per output element.
+// ============================================================================
+kernel void batchnorm2d_infer(
+    device const float* X     [[buffer(0)]],
+    device const float* gamma [[buffer(1)]],
+    device const float* beta  [[buffer(2)]],
+    device const float* mean  [[buffer(3)]],
+    device const float* var   [[buffer(4)]],
+    device       float* Y     [[buffer(5)]],
+    constant     uint&  N     [[buffer(6)]],
+    constant     uint&  C     [[buffer(7)]],
+    constant     uint&  H     [[buffer(8)]],
+    constant     uint&  W     [[buffer(9)]],
+    constant     float& eps   [[buffer(10)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = N * C * H * W;
+    if (gid >= total) return;
+
+    uint c = (gid / (W * H)) % C;
+    float inv = 1.0f / sqrt(var[c] + eps);
+    Y[gid] = gamma[c] * (X[gid] - mean[c]) * inv + beta[c];
+}
+
+// ============================================================================
 // MatMul — four implementations to compare
 // All shapes: A[..., M, K] @ B[..., K, N] = C[..., M, N], batched over leading dims
 // ============================================================================
@@ -441,6 +576,312 @@ kernel void matmul_simd_tiled(
     uint c_col = tg_col + sg_col * 8;
     if (c_row < M && c_col < N)
         simdgroup_store(c, C + batch * M * N + c_row * N + c_col, N);
+}
+
+// ============================================================================
+// f16 variants of the elementwise / structural kernels. When ComputeGraph is
+// declared with Precision::F16, all device buffers are half-sized and the
+// executor dispatches the *_f16 names below. Kernel bodies are mechanically
+// identical to the float versions; arithmetic is done in `half` (Metal's
+// math overloads handle the dispatch). BatchNorm computes in float for
+// numerical stability (sqrt of small running_var).
+// ============================================================================
+
+kernel void mat_add_f16(
+    device const half*  A     [[buffer(0)]],
+    device const half*  B     [[buffer(1)]],
+    device       half*  C     [[buffer(2)]],
+    constant     uint&  numel [[buffer(3)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index < numel) C[index] = A[index] + B[index];
+}
+
+kernel void hadamard_f16(
+    device const half*  A     [[buffer(0)]],
+    device const half*  B     [[buffer(1)]],
+    device       half*  C     [[buffer(2)]],
+    constant     uint&  numel [[buffer(3)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index < numel) C[index] = A[index] * B[index];
+}
+
+kernel void relu_f16(
+    device const half*  in    [[buffer(0)]],
+    device       half*  out   [[buffer(1)]],
+    constant     uint&  numel [[buffer(2)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index < numel) out[index] = max((half)0.0, in[index]);
+}
+
+kernel void step_op_f16(
+    device const half*  in    [[buffer(0)]],
+    device       half*  out   [[buffer(1)]],
+    constant     uint&  numel [[buffer(2)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index < numel) out[index] = in[index] > (half)0.0 ? (half)1.0 : (half)0.0;
+}
+
+kernel void sigmoid_op_f16(
+    device const half*  in    [[buffer(0)]],
+    device       half*  out   [[buffer(1)]],
+    constant     uint&  numel [[buffer(2)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index < numel) {
+        // Compute in float for stability; sigmoid(-large) underflows in half.
+        float x = (float)in[index];
+        out[index] = (half)(1.0f / (1.0f + exp(-x)));
+    }
+}
+
+kernel void scale_f16(
+    device const half*  in    [[buffer(0)]],
+    device       half*  out   [[buffer(1)]],
+    constant     uint&  numel [[buffer(2)]],
+    constant     float& s     [[buffer(3)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index < numel) out[index] = (half)((float)in[index] * s);
+}
+
+kernel void transpose_nd_f16(
+    device const half*  in        [[buffer(0)]],
+    device       half*  out       [[buffer(1)]],
+    constant     uint*  in_shape  [[buffer(2)]],
+    constant     uint*  out_shape [[buffer(3)]],
+    constant     uint*  perm      [[buffer(4)]],
+    constant     uint&  ndim      [[buffer(5)]],
+    constant     uint&  numel     [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= numel) return;
+    uint out_idx[MAX_DIMS];
+    uint rem = gid;
+    for (uint d = ndim; d-- > 0;) { out_idx[d] = rem % out_shape[d]; rem /= out_shape[d]; }
+    uint in_idx[MAX_DIMS];
+    for (uint i = 0; i < ndim; ++i) in_idx[perm[i]] = out_idx[i];
+    uint in_flat = 0, stride = 1;
+    for (uint d = ndim; d-- > 0;) { in_flat += in_idx[d] * stride; stride *= in_shape[d]; }
+    out[gid] = in[in_flat];
+}
+
+kernel void broadcast_axis_f16(
+    device const half*  in        [[buffer(0)]],
+    device       half*  out       [[buffer(1)]],
+    constant     uint*  out_shape [[buffer(2)]],
+    constant     uint&  ndim      [[buffer(3)]],
+    constant     uint&  axis      [[buffer(4)]],
+    constant     uint&  numel     [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= numel) return;
+    uint idx[8];
+    uint rem = gid;
+    for (uint d = ndim; d-- > 0;) { idx[d] = rem % out_shape[d]; rem /= out_shape[d]; }
+    idx[axis] = 0;
+    uint in_flat = 0, stride = 1;
+    for (uint d = ndim; d-- > 0;) {
+        in_flat += idx[d] * stride;
+        stride *= (d == axis) ? 1 : out_shape[d];
+    }
+    out[gid] = in[in_flat];
+}
+
+kernel void im2col_f16(
+    device const half*  X     [[buffer(0)]],
+    device       half*  Y     [[buffer(1)]],
+    constant     uint&  N     [[buffer(2)]],
+    constant     uint&  C     [[buffer(3)]],
+    constant     uint&  H     [[buffer(4)]],
+    constant     uint&  W     [[buffer(5)]],
+    constant     uint&  kH    [[buffer(6)]],
+    constant     uint&  kW    [[buffer(7)]],
+    constant     uint&  stride[[buffer(8)]],
+    constant     int&   pad   [[buffer(9)]],
+    constant     uint&  Hout  [[buffer(10)]],
+    constant     uint&  Wout  [[buffer(11)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint patch_size = C * kH * kW;
+    uint n_patches  = N * Hout * Wout;
+    uint total      = n_patches * patch_size;
+    if (gid >= total) return;
+    uint row = gid / patch_size, col = gid % patch_size;
+    uint n  = row / (Hout * Wout);
+    uint r  = row % (Hout * Wout);
+    uint oh = r   / Wout, ow = r % Wout;
+    uint c  = col / (kH * kW);
+    uint k  = col % (kH * kW);
+    uint ky = k   / kW, kx = k % kW;
+    int ih = (int)(oh * stride + ky) - pad;
+    int iw = (int)(ow * stride + kx) - pad;
+    Y[gid] = (ih >= 0 && (uint)ih < H && iw >= 0 && (uint)iw < W)
+        ? X[((n * C + c) * H + (uint)ih) * W + (uint)iw]
+        : (half)0.0;
+}
+
+kernel void maxpool2d_f16(
+    device const half*  X    [[buffer(0)]],
+    device       half*  Y    [[buffer(1)]],
+    constant     uint&  N    [[buffer(2)]],
+    constant     uint&  C    [[buffer(3)]],
+    constant     uint&  H    [[buffer(4)]],
+    constant     uint&  W    [[buffer(5)]],
+    constant     uint&  k    [[buffer(6)]],
+    constant     uint&  stride[[buffer(7)]],
+    constant     int&   pad  [[buffer(8)]],
+    constant     uint&  Hout [[buffer(9)]],
+    constant     uint&  Wout [[buffer(10)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = N * C * Hout * Wout;
+    if (gid >= total) return;
+    uint ow = gid % Wout;
+    uint oh = (gid / Wout) % Hout;
+    uint c  = (gid / (Wout * Hout)) % C;
+    uint n  = gid / (Wout * Hout * C);
+    half mx = -HALF_MAX;
+    for (uint ky = 0; ky < k; ++ky)
+        for (uint kx = 0; kx < k; ++kx) {
+            int ih = (int)(oh * stride + ky) - pad;
+            int iw = (int)(ow * stride + kx) - pad;
+            if (ih < 0 || ih >= (int)H || iw < 0 || iw >= (int)W) continue;
+            half v = X[((n * C + c) * H + (uint)ih) * W + (uint)iw];
+            if (v > mx) mx = v;
+        }
+    Y[gid] = mx;
+}
+
+kernel void upsample_nearest_f16(
+    device const half*  X     [[buffer(0)]],
+    device       half*  Y     [[buffer(1)]],
+    constant     uint&  N     [[buffer(2)]],
+    constant     uint&  C     [[buffer(3)]],
+    constant     uint&  H     [[buffer(4)]],
+    constant     uint&  W     [[buffer(5)]],
+    constant     uint&  scale [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint Ho = H * scale, Wo = W * scale;
+    uint total = N * C * Ho * Wo;
+    if (gid >= total) return;
+    uint ow = gid % Wo;
+    uint oh = (gid / Wo) % Ho;
+    uint c  = (gid / (Wo * Ho)) % C;
+    uint n  = gid / (Wo * Ho * C);
+    Y[gid] = X[((n * C + c) * H + oh / scale) * W + ow / scale];
+}
+
+kernel void concat_channel_f16(
+    device const half*  A     [[buffer(0)]],
+    device const half*  B     [[buffer(1)]],
+    device       half*  Y     [[buffer(2)]],
+    constant     uint&  N     [[buffer(3)]],
+    constant     uint&  Ca    [[buffer(4)]],
+    constant     uint&  Cb    [[buffer(5)]],
+    constant     uint&  H     [[buffer(6)]],
+    constant     uint&  W     [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint Cout = Ca + Cb;
+    uint total = N * Cout * H * W;
+    if (gid >= total) return;
+    uint w = gid % W;
+    uint h = (gid / W) % H;
+    uint c = (gid / (W * H)) % Cout;
+    uint n = gid / (W * H * Cout);
+    if (c < Ca)  Y[gid] = A[((n * Ca + c)      * H + h) * W + w];
+    else         Y[gid] = B[((n * Cb + c - Ca) * H + h) * W + w];
+}
+
+kernel void batchnorm2d_infer_f16(
+    device const half*  X     [[buffer(0)]],
+    device const half*  gamma [[buffer(1)]],
+    device const half*  beta  [[buffer(2)]],
+    device const half*  mean  [[buffer(3)]],
+    device const half*  var   [[buffer(4)]],
+    device       half*  Y     [[buffer(5)]],
+    constant     uint&  N     [[buffer(6)]],
+    constant     uint&  C     [[buffer(7)]],
+    constant     uint&  H     [[buffer(8)]],
+    constant     uint&  W     [[buffer(9)]],
+    constant     float& eps   [[buffer(10)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = N * C * H * W;
+    if (gid >= total) return;
+    uint c = (gid / (W * H)) % C;
+    // Compute in float — sqrt(small + eps) is precision-sensitive.
+    float inv = 1.0f / sqrt((float)var[c] + eps);
+    Y[gid] = (half)((float)gamma[c] * ((float)X[gid] - (float)mean[c]) * inv + (float)beta[c]);
+}
+
+// ============================================================================
+// f32 <-> f16 elementwise conversion. Used to feed MPP matmul inputs (which
+// operate on `half`) while keeping the rest of the lib's storage at float.
+// ============================================================================
+kernel void f32_to_f16(
+    device const float* in    [[buffer(0)]],
+    device       half*  out   [[buffer(1)]],
+    constant     uint&  numel [[buffer(2)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index < numel) out[index] = (half)in[index];
+}
+
+kernel void f16_to_f32(
+    device const half*  in    [[buffer(0)]],
+    device       float* out   [[buffer(1)]],
+    constant     uint&  numel [[buffer(2)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index < numel) out[index] = (float)in[index];
+}
+
+// ============================================================================
+// MetalPerformancePrimitives matmul2d (Metal 4). Inputs are half tensors,
+// output is float — mixed precision with f32 accumulation. Tile is 64 (M) x
+// 32 (N) per threadgroup, 4 SIMD groups cooperate. Edge tiles handled by MPP.
+//
+// Dispatch:
+//   grid        = MTL::Size( (N + 31) / 32, (M + 63) / 64, 1 )
+//   threadgroup = MTL::Size( 128, 1, 1 )                    // 4 SIMD-groups × 32 lanes
+// ============================================================================
+kernel void matmul_mpp(
+    device       half*  A_buf [[buffer(0)]],   // [M, K] row-major
+    device       half*  B_buf [[buffer(1)]],   // [K, N] row-major
+    device       half*  C_buf [[buffer(2)]],   // [M, N] row-major
+    constant     uint&  M     [[buffer(3)]],
+    constant     uint&  N     [[buffer(4)]],
+    constant     uint&  K     [[buffer(5)]],
+    uint2        tgid  [[threadgroup_position_in_grid]])
+{
+    // MPP dextents convention is (inner_dim, outer_dim) = (cols, rows) for
+    // row-major storage. Inline tensors wrap the raw device pointer directly.
+    // Output is half (the half×half→half combo is broadly supported). Caller
+    // can convert back to float on the host side if needed.
+    auto A = tensor<device half, dextents<int32_t, 2>, tensor_inline>(
+        A_buf, dextents<int32_t, 2>((int32_t)K, (int32_t)M));
+    auto B = tensor<device half, dextents<int32_t, 2>, tensor_inline>(
+        B_buf, dextents<int32_t, 2>((int32_t)N, (int32_t)K));
+    auto C = tensor<device half, dextents<int32_t, 2>, tensor_inline>(
+        C_buf, dextents<int32_t, 2>((int32_t)N, (int32_t)M));
+
+    constexpr auto desc = matmul2d_descriptor(
+        /*tile_M=*/64, /*tile_N=*/32,
+        /*K=*/static_cast<int>(dynamic_extent),
+        /*transpose_left=*/false, /*transpose_right=*/false,
+        /*relaxed_precision=*/false);
+    matmul2d<desc, execution_simdgroups<4>> op;
+
+    auto mA = A.slice(0,             tgid.y * 64);
+    auto mB = B.slice(tgid.x * 32,   0);
+    auto mC = C.slice(tgid.x * 32,   tgid.y * 64);
+    op.run(mA, mB, mC);
 }
 
 // (3) SIMD-group matrix: one SIMD group (32 threads) collaboratively computes

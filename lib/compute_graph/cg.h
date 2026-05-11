@@ -57,8 +57,14 @@ private:
 };
 
 // --- Enums ---
-enum class MapOp    { ReLU, Softmax, Step };  // Step: x > 0 ? 1 : 0
+enum class MapOp    { ReLU, Softmax, Step, Sigmoid };  // Step: x > 0 ? 1 : 0
 enum class ReduceOp { Sum, Mean, Max, Min };
+
+// Storage precision for device-side buffers. Host-side Tensors are always
+// f32. Backends that support f16 may downconvert at the host->device boundary
+// (and upconvert on read) when a graph is declared F16. F32 is the default
+// and the only mode CPU backends support.
+enum class Precision { F32, F16 };
 
 // --- Forward declarations ---
 class InputNode;
@@ -73,12 +79,21 @@ class BroadcastNode;
 class ReshapeNode;
 class Im2ColNode;
 class Col2ImNode;
+class MaxPool2DNode;
+class UpsampleNearestNode;
+class ConcatNode;
+class BatchNorm2DNode;
 class AssignNode;
 
 // --- Visitor interface ---
 class Visitor {
 public:
     virtual ~Visitor() = default;
+    // Called by ComputeGraph::accept() once before any visit(), so backends
+    // can adjust kernel/buffer choices based on the graph's declared
+    // precision. Default no-op for visitors that don't care (e.g. CPU
+    // executor, printer, autograd builder).
+    virtual void on_precision(Precision /*p*/) {}
     virtual void visit(InputNode&     node) = 0;
     virtual void visit(MatMulNode&    node) = 0;
     virtual void visit(MatAddNode&    node) = 0;
@@ -91,6 +106,10 @@ public:
     virtual void visit(ReshapeNode&   node) = 0;
     virtual void visit(Im2ColNode&    node) = 0;
     virtual void visit(Col2ImNode&    node) = 0;
+    virtual void visit(MaxPool2DNode& node) = 0;
+    virtual void visit(UpsampleNearestNode& node) = 0;
+    virtual void visit(ConcatNode&    node) = 0;
+    virtual void visit(BatchNorm2DNode& node) = 0;
     virtual void visit(AssignNode&    node) = 0;
 };
 
@@ -118,14 +137,22 @@ private:
 };
 
 // --- Concrete Nodes ---
+// `is_constant` marks the tensor as immutable for the lifetime of a graph
+// execution session: backends may upload the host data to the GPU once and
+// then skip subsequent re-uploads. Use this for trained model weights /
+// running statistics — anything that doesn't change between passes. For
+// training-update targets (AssignNode destinations) and per-iteration
+// inputs (the image batch), leave is_constant=false so the host value
+// re-uploads each pass.
 class InputNode : public Node {
 public:
-    InputNode(std::string name, Tensor tensor)
-        : name(std::move(name)), tensor(std::move(tensor)) {}
+    InputNode(std::string name, Tensor tensor, bool is_constant = false)
+        : name(std::move(name)), tensor(std::move(tensor)), is_constant(is_constant) {}
     void accept(Visitor& v) override { v.visit(*this); }
 
     std::string name;
     Tensor      tensor;
+    bool        is_constant;
 };
 
 class MatMulNode : public Node {
@@ -266,6 +293,77 @@ public:
     int              kH, kW, stride, pad;
 };
 
+// 2D max pool over [N, C, H, W] with square kernel `k`, stride `s`, padding `pad`.
+// Output: [N, C, (H + 2*pad - k)/s + 1, (W + 2*pad - k)/s + 1].
+// Padded positions are treated as -infinity (so they never win the max).
+// Inference-only — backward would need to remember argmax indices.
+class MaxPool2DNode : public Node {
+public:
+    MaxPool2DNode(NodeRef input, std::vector<int> input_shape, int k, int stride, int pad = 0)
+        : input(input), input_shape(std::move(input_shape)), k(k), stride(stride), pad(pad) {}
+    void accept(Visitor& v) override { v.visit(*this); }
+    std::vector<Node*> inputs() const override { return {input}; }
+
+    Node*            input;
+    std::vector<int> input_shape;   // [N, C, H, W]
+    int              k, stride, pad;
+};
+
+// Nearest-neighbor 2D upsample over [N, C, H, W] by integer factor.
+// Output is [N, C, H*scale, W*scale]. No learnable params.
+class UpsampleNearestNode : public Node {
+public:
+    UpsampleNearestNode(NodeRef input, std::vector<int> input_shape, int scale)
+        : input(input), input_shape(std::move(input_shape)), scale(scale) {}
+    void accept(Visitor& v) override { v.visit(*this); }
+    std::vector<Node*> inputs() const override { return {input}; }
+
+    Node*            input;
+    std::vector<int> input_shape;   // [N, C, H, W]
+    int              scale;
+};
+
+// Concat two 4D tensors along the channel axis (axis=1).
+// Both inputs must share [N, *, H, W]; output is [N, Ca+Cb, H, W].
+// Restricted to channel-axis + two inputs because that's all U-Net needs;
+// keeping the surface small avoids carrying a per-call axis arg into kernels.
+class ConcatNode : public Node {
+public:
+    ConcatNode(NodeRef a, NodeRef b, std::vector<int> a_shape, std::vector<int> b_shape)
+        : a(a), b(b), a_shape(std::move(a_shape)), b_shape(std::move(b_shape)) {}
+    void accept(Visitor& v) override { v.visit(*this); }
+    std::vector<Node*> inputs() const override { return {a, b}; }
+
+    Node*            a;
+    Node*            b;
+    std::vector<int> a_shape;  // [N, Ca, H, W]
+    std::vector<int> b_shape;  // [N, Cb, H, W]
+};
+
+// 2D BatchNorm in inference mode. Per channel of a [N, C, H, W] input:
+//   y = gamma * (x - running_mean) / sqrt(running_var + eps) + beta
+// gamma, beta, running_mean, running_var are each [C]. eps is a fixed scalar.
+// Training-mode backward is not implemented — this primitive exists to load
+// already-trained weights (the four per-channel tensors).
+class BatchNorm2DNode : public Node {
+public:
+    BatchNorm2DNode(NodeRef input, NodeRef gamma, NodeRef beta,
+                    NodeRef running_mean, NodeRef running_var, float eps = 1e-5f)
+        : input(input), gamma(gamma), beta(beta),
+          running_mean(running_mean), running_var(running_var), eps(eps) {}
+    void accept(Visitor& v) override { v.visit(*this); }
+    std::vector<Node*> inputs() const override {
+        return {input, gamma, beta, running_mean, running_var};
+    }
+
+    Node* input;
+    Node* gamma;
+    Node* beta;
+    Node* running_mean;
+    Node* running_var;
+    float eps;
+};
+
 // In-place assignment: copies `value` into `target`'s tensor (host) and into
 // the executor's device buffer for `target`. Used by SGD to write updated
 // parameters back into the layer's InputNode in one accept() pass — no
@@ -289,6 +387,13 @@ public:
 // --- ComputeGraph ---
 class ComputeGraph {
 public:
+    // Precision is declared at graph construction. Backends that support it
+    // (currently: metal::Executor) will lay out device buffers and dispatch
+    // kernels in the requested dtype. F32 is the default for backward compat.
+    explicit ComputeGraph(Precision precision = Precision::F32) : precision_(precision) {}
+
+    Precision precision() const { return precision_; }
+
     template<typename T, typename... Args>
     T* emplace(Args&&... args) {
         auto node = std::make_unique<T>(std::forward<Args>(args)...);
@@ -302,6 +407,7 @@ public:
     void accept(Visitor& v, Node* root);  // only nodes that `root` depends on
 
 private:
+    Precision                          precision_;
     std::vector<std::unique_ptr<Node>> nodes_;
 };
 

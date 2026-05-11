@@ -35,9 +35,11 @@ set(SHADER_AIR    "${CMAKE_CURRENT_BINARY_DIR}/kernels.air")
 set(SHADER_LIB    "${CMAKE_CURRENT_BINARY_DIR}/kernels.metallib")
 
 # .metal -> .air -> .metallib
+# -std=metal4.0 enables the Metal 4 tensor APIs and MetalPerformancePrimitives
+# (mpp::tensor_ops::matmul2d et al). Requires macOS 26 / SDK 26.4+.
 add_custom_command(
     OUTPUT  ${SHADER_LIB}
-    COMMAND ${XCRUN} -sdk macosx metal -c ${SHADER_SRC} -o ${SHADER_AIR}
+    COMMAND ${XCRUN} -sdk macosx metal -std=metal4.0 -c ${SHADER_SRC} -o ${SHADER_AIR}
     COMMAND ${XCRUN} -sdk macosx metallib ${SHADER_AIR} -o ${SHADER_LIB}
     DEPENDS ${SHADER_SRC}
     COMMENT "Compiling Metal shaders"

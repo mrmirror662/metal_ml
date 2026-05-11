@@ -275,13 +275,74 @@ TEST(im2col_col2im_parity) {
     EXPECT_NEAR(max_abs_diff(cpu, met), 0.0, 1e-5);
 }
 
+// Precision::F16 path: same graph + inputs run at f16 storage / dispatch.
+// Verifies the f16 kernel variants + half upload/download bookkeeping match
+// the f32 path within f16's precision budget.
+TEST(precision_f16_chain_parity) {
+    Tensor X = random_tensor({1, 4, 8, 8}, 91);
+    Tensor G = Tensor({4}, {1.0f, 0.8f, 1.2f, 0.5f});
+    Tensor B = Tensor({4}, {0.05f, -0.1f, 0.2f, 0.0f});
+    Tensor M = Tensor({4}, {0.1f, 0.0f, -0.05f, 0.2f});
+    Tensor V = Tensor({4}, {0.5f, 1.0f, 0.7f, 0.3f});
+
+    auto build = [&](ComputeGraph& g) {
+        auto* x  = g.emplace<InputNode>("x", X, /*const=*/true);
+        auto* gm = g.emplace<InputNode>("g", G, true);
+        auto* bt = g.emplace<InputNode>("b", B, true);
+        auto* mu = g.emplace<InputNode>("m", M, true);
+        auto* va = g.emplace<InputNode>("v", V, true);
+        auto* bn = g.emplace<BatchNorm2DNode>(x, gm, bt, mu, va, 1e-5f);
+        auto* re = g.emplace<MapNode>(bn, MapOp::ReLU);
+        return g.emplace<MaxPool2DNode>(re, std::vector<int>{1, 4, 8, 8}, 2, 2, 0);
+    };
+
+    ComputeGraph g_f32(Precision::F32); auto* y32 = build(g_f32);
+    metal::Executor e32; g_f32.accept(e32);
+    Tensor r32 = e32.result(y32);
+
+    ComputeGraph g_f16(Precision::F16); auto* y16 = build(g_f16);
+    metal::Executor e16(metal::Executor::MatMul::MPP); g_f16.accept(e16);
+    Tensor r16 = e16.result(y16);
+
+    EXPECT_TRUE(r16.shape() == r32.shape());
+    // f16 has ~3.3 decimal digits, BN + ReLU + maxpool keeps a few accumulations:
+    // 5e-3 absolute drift is comfortable.
+    EXPECT_NEAR(max_abs_diff(r16, r32), 0.0, 5e-3);
+}
+
+// MPP matmul (Apple Metal 4 mixed-precision primitive) vs CPU reference.
+// Tolerance is wider than the other parity tests because MPP runs in f16
+// internally (f32 accumulation) — small rounding drift is expected.
+TEST(matmul_mpp_parity) {
+    Tensor A = random_tensor({64, 96}, 81);
+    Tensor B = random_tensor({96, 48}, 82);
+    auto build = [&](ComputeGraph& g) {
+        auto* a = g.emplace<InputNode>("a", A);
+        auto* b = g.emplace<InputNode>("b", B);
+        return g.emplace<MatMulNode>(a, b);
+    };
+    ComputeGraph cg_; auto* yc = build(cg_);
+    cpu::Executor cpu; cg_.accept(cpu);
+    Tensor ref = cpu.result(yc);
+    EXPECT_TRUE(ref.shape() == std::vector<int>({64, 48}));
+
+    ComputeGraph cg_mpp; auto* ym = build(cg_mpp);
+    metal::Executor exec(metal::Executor::MatMul::MPP);
+    cg_mpp.accept(exec);
+    Tensor got = exec.result(ym);
+    EXPECT_TRUE(got.shape() == ref.shape());
+    // f16 has ~3.3 decimal digits of precision; for K=96 accumulations of
+    // values in [-0.5, 0.5], absolute error of ~1e-2 is generous-but-typical.
+    EXPECT_NEAR(max_abs_diff(got, ref), 0.0, 1e-2);
+}
+
 TEST(conv2d_forward_parity) {
     Tensor X = random_tensor({2, 3, 8, 8}, 1);
     Tensor K = random_tensor({4, 3, 3, 3}, 2);
     auto build = [&](ComputeGraph& g) {
         auto* x = g.emplace<InputNode>("x", X);
         auto* k = g.emplace<InputNode>("k", K);
-        return nn::conv2d(g, x, k,
+        return nn::conv2d(g, x, k, /*b=*/nullptr,
             std::vector<int>{2, 3, 8, 8},
             std::vector<int>{4, 3, 3, 3}, 1, 1);
     };
@@ -289,6 +350,133 @@ TEST(conv2d_forward_parity) {
     EXPECT_TRUE(cpu.shape() == std::vector<int>({2, 4, 8, 8}));
     Tensor met = run_metal(build);
     EXPECT_NEAR(max_abs_diff(cpu, met), 0.0, 1e-5);
+}
+
+TEST(conv2d_with_bias_parity) {
+    Tensor X = random_tensor({1, 2, 6, 6}, 13);
+    Tensor K = random_tensor({3, 2, 3, 3}, 14);
+    Tensor B({1, 3}, {0.1f, -0.2f, 0.3f});
+    auto build = [&](ComputeGraph& g) {
+        auto* x = g.emplace<InputNode>("x", X);
+        auto* k = g.emplace<InputNode>("k", K);
+        auto* b = g.emplace<InputNode>("b", B);
+        return nn::conv2d(g, x, k, b,
+            std::vector<int>{1, 2, 6, 6},
+            std::vector<int>{3, 2, 3, 3}, 1, 1);
+    };
+    Tensor cpu = run_cpu(build);
+    Tensor met = run_metal(build);
+    EXPECT_NEAR(max_abs_diff(cpu, met), 0.0, 1e-5);
+}
+
+TEST(sigmoid_parity) {
+    Tensor X = random_tensor({4, 8}, 21);
+    auto build = [&](ComputeGraph& g) {
+        auto* x = g.emplace<InputNode>("x", X);
+        return nn::sigmoid(g, x);
+    };
+    Tensor cpu = run_cpu(build);
+    // monotone, all in (0, 1)
+    for (int i = 0; i < cpu.numel(); ++i) EXPECT_TRUE(cpu[i] > 0.0f && cpu[i] < 1.0f);
+    Tensor met = run_metal(build);
+    EXPECT_NEAR(max_abs_diff(cpu, met), 0.0, 1e-6);
+}
+
+TEST(maxpool_parity) {
+    Tensor X = random_tensor({2, 3, 8, 8}, 31);
+    auto build = [&](ComputeGraph& g) {
+        auto* x = g.emplace<InputNode>("x", X);
+        return g.emplace<MaxPool2DNode>(x, std::vector<int>{2, 3, 8, 8}, 2, 2);
+    };
+    Tensor cpu = run_cpu(build);
+    EXPECT_TRUE(cpu.shape() == std::vector<int>({2, 3, 4, 4}));
+    Tensor met = run_metal(build);
+    EXPECT_NEAR(max_abs_diff(cpu, met), 0.0, 1e-6);
+}
+
+TEST(upsample_parity) {
+    Tensor X = random_tensor({1, 2, 3, 3}, 41);
+    auto build = [&](ComputeGraph& g) {
+        auto* x = g.emplace<InputNode>("x", X);
+        return g.emplace<UpsampleNearestNode>(x, std::vector<int>{1, 2, 3, 3}, 2);
+    };
+    Tensor cpu = run_cpu(build);
+    EXPECT_TRUE(cpu.shape() == std::vector<int>({1, 2, 6, 6}));
+    Tensor met = run_metal(build);
+    EXPECT_NEAR(max_abs_diff(cpu, met), 0.0, 1e-6);
+}
+
+TEST(transposed_conv2d_shape_and_parity) {
+    // 2x2 stride-2 transposed conv doubles spatial dims — standard U-Net up block.
+    Tensor X = random_tensor({1, 4, 3, 3}, 71);    // [N=1, Cin=4, H=3, W=3]
+    Tensor K = random_tensor({4, 2, 2, 2}, 72);    // [Cin=4, Cout=2, kH=2, kW=2]
+    auto build = [&](ComputeGraph& g) {
+        auto* x = g.emplace<InputNode>("x", X);
+        auto* k = g.emplace<InputNode>("k", K);
+        return nn::transposed_conv2d(g, x, k, /*b=*/nullptr,
+            std::vector<int>{1, 4, 3, 3},
+            std::vector<int>{4, 2, 2, 2}, /*stride=*/2, /*pad=*/0);
+    };
+    Tensor cpu = run_cpu(build);
+    // Hout = (3-1)*2 - 0 + 2 = 6
+    EXPECT_TRUE(cpu.shape() == std::vector<int>({1, 2, 6, 6}));
+    Tensor met = run_metal(build);
+    EXPECT_NEAR(max_abs_diff(cpu, met), 0.0, 1e-4);
+}
+
+TEST(transposed_conv2d_pytorch_convention) {
+    // Hand-verifiable case: 1x1 input, 1x1 kernel, 1 in 1 out, stride 1, pad 0.
+    // Output should be x * w, shape [1, 1, 1, 1].
+    Tensor X({1, 1, 1, 1}, {3.0f});
+    Tensor K({1, 1, 1, 1}, {2.0f});
+    auto build = [&](ComputeGraph& g) {
+        auto* x = g.emplace<InputNode>("x", X);
+        auto* k = g.emplace<InputNode>("k", K);
+        return nn::transposed_conv2d(g, x, k, nullptr,
+            std::vector<int>{1, 1, 1, 1},
+            std::vector<int>{1, 1, 1, 1}, 1, 0);
+    };
+    Tensor cpu = run_cpu(build);
+    EXPECT_NEAR(std::abs(cpu[0] - 6.0f), 0.0, 1e-6);
+}
+
+TEST(batchnorm2d_parity) {
+    Tensor X  = random_tensor({2, 3, 4, 4}, 61);
+    Tensor G  = Tensor({3}, {1.0f, 0.5f, 2.0f});
+    Tensor B  = Tensor({3}, {0.1f, -0.2f, 0.3f});
+    Tensor Mu = Tensor({3}, {0.05f, -0.1f, 0.2f});
+    Tensor Va = Tensor({3}, {0.5f, 1.0f, 0.25f});
+    auto build = [&](ComputeGraph& g) {
+        auto* x  = g.emplace<InputNode>("x", X);
+        auto* gm = g.emplace<InputNode>("g", G);
+        auto* bt = g.emplace<InputNode>("b", B);
+        auto* mu = g.emplace<InputNode>("m", Mu);
+        auto* va = g.emplace<InputNode>("v", Va);
+        return g.emplace<BatchNorm2DNode>(x, gm, bt, mu, va, 1e-5f);
+    };
+    Tensor cpu = run_cpu(build);
+    EXPECT_TRUE(cpu.shape() == std::vector<int>({2, 3, 4, 4}));
+    Tensor met = run_metal(build);
+    EXPECT_NEAR(max_abs_diff(cpu, met), 0.0, 1e-5);
+    // Spot-check: known formula on first element
+    float inv0 = 1.0f / std::sqrt(0.5f + 1e-5f);
+    float expected0 = 1.0f * (X[0] - 0.05f) * inv0 + 0.1f;
+    EXPECT_NEAR(std::abs(cpu[0] - expected0), 0.0, 1e-5);
+}
+
+TEST(concat_channel_parity) {
+    Tensor A = random_tensor({2, 3, 4, 4}, 51);
+    Tensor B = random_tensor({2, 5, 4, 4}, 52);
+    auto build = [&](ComputeGraph& g) {
+        auto* a = g.emplace<InputNode>("a", A);
+        auto* b = g.emplace<InputNode>("b", B);
+        return g.emplace<ConcatNode>(a, b,
+            std::vector<int>{2, 3, 4, 4}, std::vector<int>{2, 5, 4, 4});
+    };
+    Tensor cpu = run_cpu(build);
+    EXPECT_TRUE(cpu.shape() == std::vector<int>({2, 8, 4, 4}));
+    Tensor met = run_metal(build);
+    EXPECT_NEAR(max_abs_diff(cpu, met), 0.0, 1e-6);
 }
 
 // =============================================================================
@@ -389,13 +577,49 @@ TEST(autograd_conv2d_grad) {
     Tensor K = random_tensor({3, 2, 3, 3}, 4);
     auto build = [&](ComputeGraph& g, Node* x) {
         auto* k = g.emplace<InputNode>("k", K);
-        return nn::conv2d(g, x, k,
+        return nn::conv2d(g, x, k, /*b=*/nullptr,
             std::vector<int>{1, 2, 4, 4},
             std::vector<int>{3, 2, 3, 3}, 1, 1);
     };
     Tensor a = analytical_grad(build, X);
     Tensor n = numerical_grad(build, X);
     EXPECT_NEAR(max_abs_diff(a, n), 0.0, 1e-2);
+}
+
+// Autograd through the bias subgraph of conv2d: broadcast([1,Cout]) -> matadd.
+// Verifies that the bias gradient (which flows via BroadcastNode's backward =
+// Reduce(Sum, axis=0)) matches finite differences. Without this, fused-bias
+// convolutions would silently train wrong.
+TEST(autograd_conv2d_bias_grad) {
+    Tensor X  = random_tensor({1, 2, 4, 4}, 7);
+    Tensor K  = random_tensor({3, 2, 3, 3}, 8);
+    Tensor B0 = random_tensor({1, 3},        9);   // bias [1, Cout=3]
+
+    // dL/dB where L = sum(conv2d(X, K, B)) — compute via autograd over B.
+    auto build_for_bias = [&](ComputeGraph& g, Node* b) {
+        auto* x = g.emplace<InputNode>("x", X);
+        auto* k = g.emplace<InputNode>("k", K);
+        return nn::conv2d(g, x, k, b,
+            std::vector<int>{1, 2, 4, 4},
+            std::vector<int>{3, 2, 3, 3}, 1, 1);
+    };
+    Tensor a = analytical_grad(build_for_bias, B0);
+    Tensor n = numerical_grad(build_for_bias, B0);
+    EXPECT_TRUE(a.shape() == B0.shape());
+    EXPECT_NEAR(max_abs_diff(a, n), 0.0, 1e-2);
+
+    // Also exercise dL/dX through the full fused-bias forward to be sure the
+    // bias subgraph isn't disturbing the activation gradient.
+    auto build_for_x = [&](ComputeGraph& g, Node* x) {
+        auto* k = g.emplace<InputNode>("k", K);
+        auto* b = g.emplace<InputNode>("b", B0);
+        return nn::conv2d(g, x, k, b,
+            std::vector<int>{1, 2, 4, 4},
+            std::vector<int>{3, 2, 3, 3}, 1, 1);
+    };
+    Tensor ax = analytical_grad(build_for_x, X);
+    Tensor nx = numerical_grad(build_for_x, X);
+    EXPECT_NEAR(max_abs_diff(ax, nx), 0.0, 1e-2);
 }
 
 // =============================================================================

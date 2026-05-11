@@ -27,12 +27,16 @@ using namespace cg;
 
 // ---- Model ---------------------------------------------------------------
 struct MLP {
-    nn::Dense fc1, fc2;
-    MLP(ComputeGraph& g, std::mt19937& rng)
-        : fc1(g, 784, 128, rng), fc2(g, 128, 10, rng) {}
+    nn::Linear fc1{784, 128};
+    nn::Linear fc2{128,  10};
 
-    Node* forward(ComputeGraph& g, Node* x, int batch) {
-        return fc2(nn::relu(g, fc1(x, batch)), batch);
+    explicit MLP(std::mt19937& rng) {
+        fc1.reset_parameters(rng);
+        fc2.reset_parameters(rng);
+    }
+
+    nn::Tensor forward(nn::Tensor x) {
+        return fc2(nn::relu(fc1(x)));
     }
 
     std::vector<Node*> params() const {
@@ -46,7 +50,6 @@ struct MLP {
         fc1.apply_sgd(bb, lr);
         fc2.apply_sgd(bb, lr);
     }
-
 };
 
 // ---- Trainer: ONE graph for everything ----------------------------------
@@ -60,16 +63,18 @@ struct Trainer {
     InputNode   *OH_in = nullptr;
     Node        *y     = nullptr;     // softmax output — used by both train & eval
 
-    Trainer(std::mt19937& rng, float lr) : mlp(g, rng) {
+    Trainer(std::mt19937& rng, float lr) : mlp(rng) {
         X_in  = g.emplace<InputNode>("X",  Tensor({batch, 784}));
         OH_in = g.emplace<InputNode>("OH", Tensor({batch, n_cls}));
 
-        auto* logits = mlp.forward(g, X_in, batch);
-        y = nn::softmax(g, logits);
+        nn::Tensor x_t(&g, X_in, {batch, 784});
+        nn::Tensor logits_t = mlp.forward(x_t);
+        nn::Tensor y_t      = nn::softmax(logits_t);
+        y = y_t.node();
 
         auto* dz = nn::softmax_ce_backward(g, y, OH_in, batch);
         autograd::BackwardBuilder bb(g);
-        bb.seed(logits, dz);
+        bb.seed(logits_t.node(), dz);
         bb.build(mlp.params());
         mlp.apply_sgd(bb, lr);
     }

@@ -18,6 +18,10 @@ public:
     void visit(cg::ReshapeNode&   node) override;
     void visit(cg::Im2ColNode&    node) override;
     void visit(cg::Col2ImNode&    node) override;
+    void visit(cg::MaxPool2DNode& node) override;
+    void visit(cg::UpsampleNearestNode& node) override;
+    void visit(cg::ConcatNode&    node) override;
+    void visit(cg::BatchNorm2DNode& node) override;
     void visit(cg::AssignNode&    node) override;
 
     // Retrieve the output tensor computed for a node

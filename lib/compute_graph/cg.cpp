@@ -136,6 +136,7 @@ bool ComputeGraph::is_dag() const {
 }
 
 void ComputeGraph::accept(Visitor& v) {
+    v.on_precision(precision_);
     std::unordered_set<Node*> visited;
     std::vector<Node*> order;
     for (auto& n : nodes_) topo_post_order(n.get(), visited, order);
@@ -144,6 +145,7 @@ void ComputeGraph::accept(Visitor& v) {
 
 void ComputeGraph::accept(Visitor& v, Node* root) {
     if (!root) throw std::runtime_error("ComputeGraph::accept: root is null");
+    v.on_precision(precision_);
     std::unordered_set<Node*> visited;
     std::vector<Node*> order;
     topo_post_order(root, visited, order);

@@ -109,6 +109,10 @@ public:
             case MapOp::Step:
                 /* zero gradient — Step is non-differentiable */
                 break;
+            case MapOp::Sigmoid:
+                /* d/dx sigmoid(x) = y * (1 - y).  We have y = MapNode result. */
+                accumulate(n.input, nn::sigmoid_backward(g_, dy, &n));
+                break;
             case MapOp::Softmax:
                 throw std::runtime_error(
                     "Autograd: Softmax is not differentiable here. "
@@ -159,6 +163,21 @@ public:
         // produces the patches matrix that matches col2im's input shape.
         accumulate(n.input,
             g_.emplace<Im2ColNode>(dy, n.output_shape, n.kH, n.kW, n.stride, n.pad));
+    }
+
+    // Inference-only ops. Adding training support would require storing argmax
+    // indices (MaxPool) or emitting reduce/slice subgraphs (Upsample/Concat).
+    void visit(MaxPool2DNode&) override {
+        throw std::runtime_error("Autograd: MaxPool2D backward not implemented");
+    }
+    void visit(UpsampleNearestNode&) override {
+        throw std::runtime_error("Autograd: UpsampleNearest backward not implemented");
+    }
+    void visit(ConcatNode&) override {
+        throw std::runtime_error("Autograd: Concat backward not implemented");
+    }
+    void visit(BatchNorm2DNode&) override {
+        throw std::runtime_error("Autograd: BatchNorm2D backward not implemented (inference-only)");
     }
 
     void visit(AssignNode&) override { /* not differentiable; SGD sinks */ }

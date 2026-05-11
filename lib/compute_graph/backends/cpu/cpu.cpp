@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 
@@ -23,6 +24,13 @@ static void foreach_index(const std::vector<int>& shape,
 }
 
 void Executor::visit(cg::InputNode& node) {
+    // For constant inputs, skip the tensor copy on every pass after the
+    // first — the value can't have changed. Matches the Metal executor's
+    // pin-weights behaviour so both backends benefit identically.
+    if (node.is_constant) {
+        auto it = results_.find(&node);
+        if (it != results_.end() && it->second.shape() == node.tensor.shape()) return;
+    }
     results_[&node] = node.tensor;
 }
 
@@ -129,6 +137,10 @@ void Executor::visit(cg::MapNode& node) {
 
         case cg::MapOp::Step:
             for (auto& v : out) v = v > 0.0f ? 1.0f : 0.0f;
+            break;
+
+        case cg::MapOp::Sigmoid:
+            for (auto& v : out) v = 1.0f / (1.0f + std::exp(-v));
             break;
 
         case cg::MapOp::Softmax: {
@@ -314,6 +326,107 @@ void Executor::visit(cg::Col2ImNode& node) {
             }
         }
     }
+    results_[&node] = std::move(out);
+}
+
+// MaxPool2D: [N,C,H,W] -> [N,C,Hout,Wout]
+void Executor::visit(cg::MaxPool2DNode& node) {
+    const Tensor& X = results_.at(node.input);
+    if (X.ndim() != 4) throw std::runtime_error("MaxPool: expected 4D input");
+    int N = X.shape()[0], C = X.shape()[1], H = X.shape()[2], W = X.shape()[3];
+    int k = node.k, s = node.stride, p = node.pad;
+    int Hout = (H + 2 * p - k) / s + 1;
+    int Wout = (W + 2 * p - k) / s + 1;
+
+    Tensor out({N, C, Hout, Wout});
+    for (int n = 0; n < N; ++n)
+        for (int c = 0; c < C; ++c)
+            for (int oh = 0; oh < Hout; ++oh)
+                for (int ow = 0; ow < Wout; ++ow) {
+                    float mx = -std::numeric_limits<float>::infinity();
+                    for (int ky = 0; ky < k; ++ky)
+                        for (int kx = 0; kx < k; ++kx) {
+                            int ih = oh * s + ky - p;
+                            int iw = ow * s + kx - p;
+                            if (ih < 0 || ih >= H || iw < 0 || iw >= W) continue;
+                            float v = X[((n * C + c) * H + ih) * W + iw];
+                            if (v > mx) mx = v;
+                        }
+                    out[((n * C + c) * Hout + oh) * Wout + ow] = mx;
+                }
+    results_[&node] = std::move(out);
+}
+
+// UpsampleNearest: [N,C,H,W] -> [N,C,H*scale,W*scale]
+void Executor::visit(cg::UpsampleNearestNode& node) {
+    const Tensor& X = results_.at(node.input);
+    if (X.ndim() != 4) throw std::runtime_error("Upsample: expected 4D input");
+    int N = X.shape()[0], C = X.shape()[1], H = X.shape()[2], W = X.shape()[3];
+    int s = node.scale;
+    int Ho = H * s, Wo = W * s;
+
+    Tensor out({N, C, Ho, Wo});
+    for (int n = 0; n < N; ++n)
+        for (int c = 0; c < C; ++c)
+            for (int oh = 0; oh < Ho; ++oh)
+                for (int ow = 0; ow < Wo; ++ow)
+                    out[((n * C + c) * Ho + oh) * Wo + ow] =
+                        X[((n * C + c) * H + oh / s) * W + ow / s];
+    results_[&node] = std::move(out);
+}
+
+// Concat along channel axis (axis=1): [N,Ca,H,W] + [N,Cb,H,W] -> [N,Ca+Cb,H,W]
+void Executor::visit(cg::ConcatNode& node) {
+    const Tensor& A = results_.at(node.a);
+    const Tensor& B = results_.at(node.b);
+    if (A.ndim() != 4 || B.ndim() != 4)
+        throw std::runtime_error("Concat: expected 4D inputs");
+    int N = A.shape()[0], Ca = A.shape()[1], H = A.shape()[2], W = A.shape()[3];
+    int Cb = B.shape()[1];
+    if (B.shape()[0] != N || B.shape()[2] != H || B.shape()[3] != W)
+        throw std::runtime_error("Concat: N/H/W mismatch");
+
+    Tensor out({N, Ca + Cb, H, W});
+    int plane = H * W;
+    for (int n = 0; n < N; ++n) {
+        std::memcpy(out.data() + (n * (Ca + Cb))      * plane,
+                    A.data()   + (n * Ca)             * plane,
+                    Ca * plane * sizeof(float));
+        std::memcpy(out.data() + (n * (Ca + Cb) + Ca) * plane,
+                    B.data()   + (n * Cb)             * plane,
+                    Cb * plane * sizeof(float));
+    }
+    results_[&node] = std::move(out);
+}
+
+// BatchNorm2D inference: y = gamma * (x - mean) / sqrt(var + eps) + beta
+void Executor::visit(cg::BatchNorm2DNode& node) {
+    const Tensor& X = results_.at(node.input);
+    const Tensor& g = results_.at(node.gamma);
+    const Tensor& bt = results_.at(node.beta);
+    const Tensor& mu = results_.at(node.running_mean);
+    const Tensor& va = results_.at(node.running_var);
+    if (X.ndim() != 4) throw std::runtime_error("BatchNorm2D: expected 4D input");
+    int N = X.shape()[0], C = X.shape()[1], H = X.shape()[2], W = X.shape()[3];
+    if (g.numel() != C || bt.numel() != C || mu.numel() != C || va.numel() != C)
+        throw std::runtime_error("BatchNorm2D: per-channel param size mismatch");
+
+    Tensor out({N, C, H, W});
+    // Precompute per-channel scale/bias so the inner loop is a single mul+add.
+    std::vector<float> scale(C), shift(C);
+    for (int c = 0; c < C; ++c) {
+        float inv = 1.0f / std::sqrt(va[c] + node.eps);
+        scale[c] = g[c] * inv;
+        shift[c] = bt[c] - mu[c] * scale[c];
+    }
+    int plane = H * W;
+    for (int n = 0; n < N; ++n)
+        for (int c = 0; c < C; ++c) {
+            const float* xp = X.data() + (n * C + c) * plane;
+            float*       op = out.data() + (n * C + c) * plane;
+            float s = scale[c], b = shift[c];
+            for (int i = 0; i < plane; ++i) op[i] = xp[i] * s + b;
+        }
     results_[&node] = std::move(out);
 }
 

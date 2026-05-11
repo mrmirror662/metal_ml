@@ -69,6 +69,26 @@ public:
               + " (" + ref(node.input) + ")", node);
     }
 
+    void visit(MaxPool2DNode& node) override {
+        print("MaxPool k=" + std::to_string(node.k) + " s=" + std::to_string(node.stride)
+              + " p=" + std::to_string(node.pad)
+              + " (" + ref(node.input) + ")", node);
+    }
+
+    void visit(UpsampleNearestNode& node) override {
+        print("Upsample scale=" + std::to_string(node.scale)
+              + " (" + ref(node.input) + ")", node);
+    }
+
+    void visit(ConcatNode& node) override {
+        print("Concat  ch (" + ref(node.a) + ", " + ref(node.b) + ")", node);
+    }
+
+    void visit(BatchNorm2DNode& node) override {
+        print("BatchNorm2D eps=" + std::to_string(node.eps)
+              + " (" + ref(node.input) + ")", node);
+    }
+
     void visit(AssignNode& node) override {
         print("Assign  -> \"" + node.target->name + "\" (" + ref(node.value) + ")", node);
     }
@@ -103,6 +123,7 @@ private:
             case MapOp::ReLU:    return "ReLU";
             case MapOp::Softmax: return "Softmax";
             case MapOp::Step:    return "Step";
+            case MapOp::Sigmoid: return "Sigmoid";
         }
         return "?";
     }

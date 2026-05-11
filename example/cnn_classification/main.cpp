@@ -21,23 +21,26 @@ using namespace cg;
 
 // ---- Model ---------------------------------------------------------------
 struct CNN {
-    nn::Conv2D conv1;
-    nn::Dense  fc;
+    nn::Conv2D conv1{/*in*/1, /*out*/8, /*k=*/3, /*stride=*/2, /*pad=*/1, /*bias=*/true};
+    nn::Linear fc{1568, 10};
 
-    CNN(ComputeGraph& g, std::mt19937& rng)
-        : conv1(g, /*in*/1, /*out*/8, /*kH*/3, /*kW*/3, /*stride*/2, /*pad*/1, rng)
-        , fc(g, 1568, 10, rng) {}
+    explicit CNN(std::mt19937& rng) {
+        conv1.reset_parameters(rng);
+        fc.reset_parameters(rng);
+    }
 
-    Node* forward(ComputeGraph& g, Node* x_flat, int batch) {
-        auto* x4d  = g.emplace<ReshapeNode>(x_flat,
+    nn::Tensor forward(nn::Tensor x_flat) {
+        auto* g = x_flat.graph();
+        int batch = x_flat.size(0);
+        auto* x4d  = g->emplace<ReshapeNode>(x_flat.node(),
                        std::vector<int>{batch, 784},
                        std::vector<int>{batch, 1, 28, 28});
-        auto* c    = conv1(x4d, std::vector<int>{batch, 1, 28, 28});
-        auto* a    = nn::relu(g, c);
-        auto* flat = g.emplace<ReshapeNode>(a,
-                       std::vector<int>{batch, 8, 14, 14},
+        nn::Tensor x4(g, x4d, {batch, 1, 28, 28});
+        nn::Tensor c = nn::relu(conv1(x4));
+        auto* flat = g->emplace<ReshapeNode>(c.node(),
+                       c.shape(),
                        std::vector<int>{batch, 1568});
-        return       fc(flat, batch);
+        return fc(nn::Tensor(g, flat, {batch, 1568}));
     }
 
     std::vector<Node*> params() const {
@@ -51,7 +54,6 @@ struct CNN {
         conv1.apply_sgd(bb, lr);
         fc.apply_sgd(bb, lr);
     }
-
 };
 
 // ---- Trainer: one persistent graph --------------------------------------
@@ -65,16 +67,18 @@ struct Trainer {
     InputNode   *OH_in = nullptr;
     Node        *y     = nullptr;
 
-    Trainer(std::mt19937& rng, float lr) : model(g, rng) {
+    Trainer(std::mt19937& rng, float lr) : model(rng) {
         X_in  = g.emplace<InputNode>("X",  Tensor({batch, 784}));
         OH_in = g.emplace<InputNode>("OH", Tensor({batch, n_cls}));
 
-        auto* logits = model.forward(g, X_in, batch);
-        y = nn::softmax(g, logits);
+        nn::Tensor x_t(&g, X_in, {batch, 784});
+        nn::Tensor logits_t = model.forward(x_t);
+        nn::Tensor y_t      = nn::softmax(logits_t);
+        y = y_t.node();
 
         auto* dz = nn::softmax_ce_backward(g, y, OH_in, batch);
         autograd::BackwardBuilder bb(g);
-        bb.seed(logits, dz);
+        bb.seed(logits_t.node(), dz);
         bb.build(model.params());
         model.apply_sgd(bb, lr);
     }

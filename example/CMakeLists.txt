@@ -1,3 +1,4 @@
 add_subdirectory(common)
 add_subdirectory(mlp_classification)
 add_subdirectory(cnn_classification)
+add_subdirectory(segmentation)
